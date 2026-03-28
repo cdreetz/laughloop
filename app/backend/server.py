@@ -12,7 +12,6 @@ Endpoints:
   GET  /health       — Health check (includes current model info)
 """
 
-import glob as glob_mod
 import json
 import os
 import threading
@@ -309,7 +308,8 @@ def _get_batch_files() -> list[dict]:
         if path.name == "latest.jsonl":
             continue
         try:
-            line_count = sum(1 for _ in open(path))
+            with open(path) as fh:
+                line_count = sum(1 for _ in fh)
             stat = path.stat()
             batches.append({
                 "filename": path.name,
