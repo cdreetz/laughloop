@@ -27,6 +27,52 @@ DEFAULT_DATA_DIR = os.getenv(
     str(Path(__file__).parent.parent.parent / "data" / "batches"),
 )
 
+# Fallback sample data for cloud training when local files aren't available.
+# In production, the pipeline exports real user interactions; these seeds
+# let the environment boot even without a local data directory.
+FALLBACK_DATA = [
+    {
+        "question": "Tell me a joke",
+        "answer": "Why don't skeletons fight each other? They don't have the guts.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-1", "original_response": "Why don't skeletons fight each other? They don't have the guts."},
+    },
+    {
+        "question": "What's the meaning of life?",
+        "answer": "42, but with inflation it's probably 47 by now.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-2", "original_response": "42, but with inflation it's probably 47 by now."},
+    },
+    {
+        "question": "Roast my code",
+        "answer": "I'd roast your code but it already burned itself with that infinite loop.",
+        "info": {"human_reward": 0.0, "feedback": "not_funny", "interaction_id": "seed-3", "original_response": "I'd roast your code but it already burned itself with that infinite loop."},
+    },
+    {
+        "question": "Why is programming hard?",
+        "answer": "Because you spend 6 hours debugging only to find the bug was a missing semicolon.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-4", "original_response": "Because you spend 6 hours debugging only to find the bug was a missing semicolon."},
+    },
+    {
+        "question": "Tell me something funny about AI",
+        "answer": "AI will replace all jobs except mine because I'm the one writing the jokes.",
+        "info": {"human_reward": 0.0, "feedback": "not_funny", "interaction_id": "seed-5", "original_response": "AI will replace all jobs except mine because I'm the one writing the jokes."},
+    },
+    {
+        "question": "How do I fix a bug?",
+        "answer": "Step 1: Blame it on someone else. Step 2: Realize you're the only developer.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-6", "original_response": "Step 1: Blame it on someone else. Step 2: Realize you're the only developer."},
+    },
+    {
+        "question": "What's your favorite language?",
+        "answer": "Python, because it's the only language where indentation is a personality trait.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-7", "original_response": "Python, because it's the only language where indentation is a personality trait."},
+    },
+    {
+        "question": "Explain recursion",
+        "answer": "To understand recursion, first you must understand recursion. See: recursion.",
+        "info": {"human_reward": 1.0, "feedback": "funny", "interaction_id": "seed-8", "original_response": "To understand recursion, first you must understand recursion. See: recursion."},
+    },
+]
+
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
 Rules:
@@ -66,35 +112,39 @@ def load_environment(
     """
 
     def build_dataset() -> Dataset:
-        """Load the latest batch of training data."""
+        """Load the latest batch of training data.
+
+        Tries the local data directory first (for local dev / fresh exports),
+        then falls back to embedded seed data so the environment always boots
+        even when running in Prime's cloud infrastructure.
+        """
         data_path = Path(data_dir) / data_file
+        records: list[dict] = []
 
-        if not data_path.exists():
-            raise FileNotFoundError(
-                f"Training data not found at {data_path}. "
-                f"Run `python pipeline/export_batch.py` first."
-            )
+        if data_path.exists():
+            with open(data_path) as f:
+                for line in f:
+                    if line.strip():
+                        records.append(json.loads(line))
 
-        records = []
-        with open(data_path) as f:
-            for line in f:
-                if line.strip():
-                    records.append(json.loads(line))
-
+        # Fall back to embedded seed data when no local file is available
         if not records:
-            raise ValueError(f"No records found in {data_path}")
+            records = FALLBACK_DATA
 
         # Convert to dataset format
         dataset_records = []
         for record in records:
+            info = record["info"]
+            if isinstance(info, str):
+                info = json.loads(info)
             dataset_records.append({
                 "question": record["question"],
                 "answer": record.get("answer", ""),
                 "info": json.dumps({
-                    "human_reward": record["info"]["human_reward"],
-                    "feedback": record["info"]["feedback"],
+                    "human_reward": info["human_reward"],
+                    "feedback": info["feedback"],
                     "original_response": record.get("answer", ""),
-                    "interaction_id": record["info"].get("interaction_id", ""),
+                    "interaction_id": info.get("interaction_id", ""),
                 }),
             })
 

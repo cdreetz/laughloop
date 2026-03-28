@@ -1,6 +1,6 @@
 [project]
 name = "laughloop-reward"
-version = "0.1.0"
+version = "0.2.0"
 description = "RL environment for training funnier AI responses using human humor feedback"
 tags = ["humor", "single-turn", "rlhf", "feedback", "train"]
 requires-python = ">=3.10"
