@@ -14,7 +14,7 @@ import json
 import random
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "app" / "backend" / "laughloop.db"
@@ -73,7 +73,7 @@ def seed(count: int = 100):
     conn = init_db()
 
     all_exchanges = FUNNY_EXCHANGES + NOT_FUNNY_EXCHANGES
-    base_time = datetime.utcnow() - timedelta(hours=count)
+    base_time = datetime.now(timezone.utc) - timedelta(hours=count)
 
     inserted = 0
     session_id = str(uuid.uuid4())
