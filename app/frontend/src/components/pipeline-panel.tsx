@@ -7,61 +7,30 @@ interface PipelinePanelProps {
   refreshKey: number;
 }
 
-function ProgressBar({
-  value,
-  max,
-  color = "bg-accent",
-}: {
-  value: number;
-  max: number;
-  color?: string;
-}) {
+function ProgressBar({ value, max }: { value: number; max: number }) {
   const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
   return (
-    <div className="h-2 w-full overflow-hidden rounded-full bg-background">
+    <div className="h-1 w-full overflow-hidden rounded-full bg-border-custom">
       <div
-        className={`h-full rounded-full transition-all duration-500 ${color}`}
+        className="h-full rounded-full bg-foreground transition-all duration-500"
         style={{ width: `${pct}%` }}
       />
     </div>
   );
 }
 
-function PipelineStage({
+function Stage({
   label,
-  active,
-  completed,
   children,
 }: {
   label: string;
-  active: boolean;
-  completed: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div
-      className={`rounded-lg border p-3 transition-all ${
-        active
-          ? "border-accent bg-accent-glow"
-          : completed
-            ? "border-funny/30 bg-funny-glow/30"
-            : "border-border-custom bg-surface"
-      }`}
-    >
-      <div className="mb-2 flex items-center gap-2">
-        <div
-          className={`h-2.5 w-2.5 rounded-full ${
-            active
-              ? "bg-accent animate-pulse"
-              : completed
-                ? "bg-funny"
-                : "bg-border-custom"
-          }`}
-        />
-        <span className="font-mono text-[11px] font-semibold uppercase tracking-wider text-text-dim">
-          {label}
-        </span>
-      </div>
+    <div className="space-y-2">
+      <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-text-dim">
+        {label}
+      </span>
       {children}
     </div>
   );
@@ -96,53 +65,28 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border-custom px-3 py-2">
-        <div className="flex items-center gap-2">
-          <div
-            className={`h-2 w-2 rounded-full ${
-              isTraining ? "bg-accent animate-pulse" : "bg-text-dim"
-            }`}
-          />
-          <h3 className="font-mono text-xs font-semibold uppercase tracking-wider text-text-dim">
-            Training Pipeline
-          </h3>
-        </div>
-        <div className="flex items-center gap-1.5 rounded-full border border-border-custom bg-surface px-2.5 py-1">
-          <span className="font-mono text-[10px] text-text-dim">model</span>
-          <span
-            className={`font-mono text-[11px] font-bold ${
-              model.version > 0 ? "text-funny" : "text-accent"
-            }`}
-          >
-            {model.version_display}
-          </span>
-        </div>
+        <h3 className="font-mono text-[11px] font-medium text-text-dim">
+          Training Pipeline
+        </h3>
+        <span className="font-mono text-[10px] text-text-dim">
+          {model.version_display}
+        </span>
       </div>
 
-      <div className="flex-1 space-y-3 overflow-y-auto p-3">
-        {/* Stage 1: Data Collection */}
-        <PipelineStage
-          label="1. Collect Feedback"
-          active={!isTraining}
-          completed={batch_queue.ready_for_export}
-        >
+      <div className="flex-1 space-y-4 overflow-y-auto p-3">
+        <Stage label="1. Collect Feedback">
           <div className="space-y-1.5">
             <div className="flex justify-between font-mono text-[11px]">
               <span className="text-text-dim">
-                {data_collection.unexported} / {batch_queue.min_batch_size}{" "}
-                labeled
+                {data_collection.unexported} / {batch_queue.min_batch_size} labeled
               </span>
-              <span
-                className={
-                  batch_queue.ready_for_export ? "text-funny" : "text-accent"
-                }
-              >
-                {batch_queue.ready_for_export ? "Ready!" : "Collecting..."}
+              <span className="text-text-dim">
+                {batch_queue.ready_for_export ? "Ready" : "Collecting"}
               </span>
             </div>
             <ProgressBar
               value={data_collection.unexported}
               max={batch_queue.min_batch_size}
-              color={batch_queue.ready_for_export ? "bg-funny" : "bg-accent"}
             />
             <div className="flex gap-3 font-mono text-[10px] text-text-dim">
               <span>{data_collection.total_interactions} total</span>
@@ -150,109 +94,65 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
               <span>{data_collection.exported} exported</span>
             </div>
           </div>
-        </PipelineStage>
+        </Stage>
 
-        {/* Arrow connector */}
-        <div className="flex justify-center">
-          <div className="font-mono text-xs text-text-dim">
-            {"\u2193"}
-          </div>
-        </div>
+        <Stage label="2. Export Batch">
+          {batch_queue.batches.length > 0 ? (
+            <div className="space-y-1">
+              {batch_queue.batches.slice(0, 3).map((batch) => (
+                <div
+                  key={batch.filename}
+                  className="flex items-center justify-between font-mono text-[10px]"
+                >
+                  <span className="truncate text-foreground">
+                    {batch.filename}
+                  </span>
+                  <span className="ml-2 shrink-0 text-text-dim">
+                    {batch.records} records
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="font-mono text-[10px] text-text-dim">
+              No batches yet
+            </p>
+          )}
+        </Stage>
 
-        {/* Stage 2: Batch Export */}
-        <PipelineStage
-          label="2. Export Training Batch"
-          active={training.status === "exporting"}
-          completed={batch_queue.batches.length > 0}
-        >
-          <div className="space-y-1.5">
-            {batch_queue.batches.length > 0 ? (
-              <div className="space-y-1">
-                {batch_queue.batches.slice(0, 3).map((batch) => (
-                  <div
-                    key={batch.filename}
-                    className="flex items-center justify-between rounded border border-border-custom bg-background px-2 py-1"
-                  >
-                    <span className="truncate font-mono text-[10px] text-foreground">
-                      {batch.filename}
-                    </span>
-                    <span className="ml-2 shrink-0 font-mono text-[10px] text-text-dim">
-                      {batch.records} records
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="font-mono text-[10px] text-text-dim">
-                No batches exported yet
-              </p>
-            )}
-          </div>
-        </PipelineStage>
-
-        {/* Arrow connector */}
-        <div className="flex justify-center">
-          <div className="font-mono text-xs text-text-dim">
-            {"\u2193"}
-          </div>
-        </div>
-
-        {/* Stage 3: RL Training */}
-        <PipelineStage
-          label="3. RL Training (Prime)"
-          active={training.status === "training"}
-          completed={training.batches_completed > 0}
-        >
-          <div className="space-y-1.5">
+        <Stage label="3. RL Training">
+          <div className="space-y-1">
             <div className="flex justify-between font-mono text-[11px]">
               <span className="text-text-dim">
-                {training.batches_completed} runs completed
+                {training.batches_completed} runs
               </span>
               <span
                 className={
-                  training.status === "training"
-                    ? "text-accent animate-pulse"
+                  isTraining
+                    ? "text-foreground"
                     : "text-text-dim"
                 }
               >
                 {training.status === "training"
                   ? "Training..."
                   : training.status === "idle"
-                    ? "Waiting"
+                    ? "Idle"
                     : training.status}
               </span>
             </div>
             {training.last_training_time && (
               <p className="font-mono text-[10px] text-text-dim">
-                Last run: {new Date(training.last_training_time).toLocaleString()}
+                Last: {new Date(training.last_training_time).toLocaleString()}
               </p>
             )}
           </div>
-        </PipelineStage>
+        </Stage>
 
-        {/* Arrow connector */}
-        <div className="flex justify-center">
-          <div className="font-mono text-xs text-text-dim">
-            {"\u2193"}
-          </div>
-        </div>
-
-        {/* Stage 4: Model Deployment */}
-        <PipelineStage
-          label="4. Deploy Adapter"
-          active={training.status === "deploying"}
-          completed={model.version > 0}
-        >
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="font-mono text-[11px] text-text-dim">
-                Active model:
-              </span>
-              <span
-                className={`font-mono text-sm font-bold ${
-                  model.version > 0 ? "text-funny" : "text-accent"
-                }`}
-              >
+        <Stage label="4. Deploy Adapter">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between font-mono text-[11px]">
+              <span className="text-text-dim">Active:</span>
+              <span className="text-foreground">
                 {model.name.split("/").pop()} {model.version_display}
               </span>
             </div>
@@ -268,14 +168,13 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
                     key={i}
                     className="font-mono text-[10px] text-text-dim"
                   >
-                    v{h.version}: {h.adapter_id.slice(0, 12)}... ({h.batch_size}{" "}
-                    samples)
+                    v{h.version}: {h.adapter_id.slice(0, 12)}... ({h.batch_size} samples)
                   </div>
                 ))}
               </div>
             )}
           </div>
-        </PipelineStage>
+        </Stage>
       </div>
     </div>
   );

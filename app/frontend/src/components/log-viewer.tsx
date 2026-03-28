@@ -20,32 +20,17 @@ function formatTime(ts: string): string {
 function FeedbackBadge({ feedback }: { feedback: number | null }) {
   if (feedback === 1) {
     return (
-      <span className="inline-flex items-center rounded-full bg-funny-glow px-2 py-0.5 text-[10px] font-semibold text-funny">
-        HAHA
-      </span>
+      <span className="font-mono text-[10px] text-funny">haha</span>
     );
   }
   if (feedback === 0) {
     return (
-      <span className="inline-flex items-center rounded-full bg-not-funny-glow px-2 py-0.5 text-[10px] font-semibold text-not-funny">
-        MEH
-      </span>
+      <span className="font-mono text-[10px] text-not-funny">meh</span>
     );
   }
   return (
-    <span className="inline-flex items-center rounded-full border border-border-custom px-2 py-0.5 text-[10px] text-text-dim">
-      PENDING
-    </span>
+    <span className="font-mono text-[10px] text-text-dim">pending</span>
   );
-}
-
-function ExportBadge({ exported }: { exported: number }) {
-  if (exported === 1) {
-    return (
-      <span className="text-[10px] text-text-dim opacity-50">exported</span>
-    );
-  }
-  return null;
 }
 
 export function LogViewer({ refreshKey }: LogViewerProps) {
@@ -77,12 +62,9 @@ export function LogViewer({ refreshKey }: LogViewerProps) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-border-custom px-3 py-2">
-        <div className="flex items-center gap-2">
-          <div className="h-2 w-2 rounded-full bg-funny animate-pulse" />
-          <h3 className="font-mono text-xs font-semibold uppercase tracking-wider text-text-dim">
-            Interaction Log
-          </h3>
-        </div>
+        <h3 className="font-mono text-[11px] font-medium text-text-dim">
+          Interaction Log
+        </h3>
         <span className="font-mono text-[10px] text-text-dim">
           {total} entries
         </span>
@@ -93,8 +75,6 @@ export function LogViewer({ refreshKey }: LogViewerProps) {
           <div className="flex h-full items-center justify-center p-4">
             <p className="text-center font-mono text-xs text-text-dim">
               No interactions yet.
-              <br />
-              Send a message to see log entries appear here.
             </p>
           </div>
         ) : (
@@ -105,44 +85,41 @@ export function LogViewer({ refreshKey }: LogViewerProps) {
                 onClick={() =>
                   setExpanded(expanded === ix.id ? null : ix.id)
                 }
-                className="w-full cursor-pointer px-3 py-2 text-left transition-colors hover:bg-surface"
+                className="w-full cursor-pointer px-3 py-2 text-left transition-colors hover:bg-background"
               >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[10px] text-text-dim">
-                        {formatTime(ix.timestamp)}
-                      </span>
-                      <FeedbackBadge feedback={ix.feedback} />
-                      <ExportBadge exported={ix.exported} />
-                    </div>
-                    <p className="mt-1 truncate text-xs text-foreground">
-                      <span className="text-accent">Q:</span>{" "}
-                      {ix.user_message}
-                    </p>
-                    {expanded === ix.id ? (
-                      <div className="mt-2 space-y-1.5">
-                        <p className="whitespace-pre-wrap text-xs leading-relaxed text-text-dim">
-                          <span className="text-funny">A:</span>{" "}
-                          {ix.assistant_message}
-                        </p>
-                        <div className="flex flex-wrap gap-2 font-mono text-[10px] text-text-dim">
-                          <span>id: {ix.id.slice(0, 8)}</span>
-                          <span>session: {ix.session_id.slice(0, 8)}</span>
-                          <span>model: {ix.model}</span>
-                          {ix.adapter_id && (
-                            <span>adapter: {ix.adapter_id.slice(0, 8)}</span>
-                          )}
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="mt-0.5 truncate text-xs text-text-dim">
-                        <span className="text-funny">A:</span>{" "}
-                        {ix.assistant_message}
-                      </p>
-                    )}
-                  </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-[10px] text-text-dim">
+                    {formatTime(ix.timestamp)}
+                  </span>
+                  <FeedbackBadge feedback={ix.feedback} />
+                  {ix.exported === 1 && (
+                    <span className="font-mono text-[10px] text-text-dim opacity-50">
+                      exported
+                    </span>
+                  )}
                 </div>
+                <p className="mt-1 truncate text-xs text-foreground">
+                  {ix.user_message}
+                </p>
+                {expanded === ix.id ? (
+                  <div className="mt-2 space-y-1">
+                    <p className="whitespace-pre-wrap text-xs leading-relaxed text-text-dim">
+                      {ix.assistant_message}
+                    </p>
+                    <div className="flex flex-wrap gap-2 font-mono text-[10px] text-text-dim opacity-60">
+                      <span>id: {ix.id.slice(0, 8)}</span>
+                      <span>session: {ix.session_id.slice(0, 8)}</span>
+                      <span>model: {ix.model}</span>
+                      {ix.adapter_id && (
+                        <span>adapter: {ix.adapter_id.slice(0, 8)}</span>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="mt-0.5 truncate text-xs text-text-dim">
+                    {ix.assistant_message}
+                  </p>
+                )}
               </button>
             ))}
           </div>
