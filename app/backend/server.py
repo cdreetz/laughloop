@@ -533,17 +533,18 @@ def _start_run_watcher(run_id: str):
     # Cancel any previous watcher
     if _run_watcher_task and not _run_watcher_task.done():
         _run_watcher_task.cancel()
-    _run_watcher_task = asyncio.get_event_loop().create_task(_watch_run(run_id))
+    _run_watcher_task = asyncio.create_task(_watch_run(run_id))
 
 
 async def _watch_run(run_id: str):
     """Poll Prime API for run status; when COMPLETED, deploy the adapter."""
     global ADAPTER_ID
     poll_interval = 30  # seconds between status checks
+    max_polls = 360  # ~3 hours max before giving up
     logger.info("Run watcher started for %s", run_id)
 
     try:
-        while True:
+        for _poll_count in range(max_polls):
             await asyncio.sleep(poll_interval)
             try:
                 async with httpx.AsyncClient(timeout=30) as http_client:
@@ -575,6 +576,11 @@ async def _watch_run(run_id: str):
             except Exception:
                 logger.exception("Error polling run %s", run_id)
                 # Keep trying — transient network errors shouldn't kill the watcher
+
+        # Exhausted max polls
+        logger.warning("Run watcher for %s timed out after %d polls", run_id, max_polls)
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
 
     except asyncio.CancelledError:
         logger.info("Run watcher for %s cancelled", run_id)
@@ -643,6 +649,7 @@ async def _auto_deploy_adapter(run_id: str):
                     "version": _training_state["model_version"],
                     "adapter_id": adapter_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "batch_size": adapter.get("step", 0),
                 })
                 _training_state["status"] = "idle"
                 _training_state["active_run_id"] = None
