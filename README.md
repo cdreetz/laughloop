@@ -8,7 +8,7 @@ LaughLoop is an end-to-end MVP demonstrating online reinforcement learning. It's
 
 ```
 ┌─────────────┐    ┌──────────────┐    ┌────────────────┐
-│  React Chat │───▶│  FastAPI     │───▶│  SQLite Log DB │
+│  Next.js    │───▶│  FastAPI     │───▶│  JSONL Log     │
 │  Frontend   │◀───│  Backend     │    │  (interactions │
 │  + Haha btn │    │  /chat       │    │   + feedback)  │
 └─────────────┘    │  /feedback   │    └───────┬────────┘
@@ -39,9 +39,9 @@ LaughLoop is an end-to-end MVP demonstrating online reinforcement learning. It's
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| Chat Frontend | `app/frontend/` | React chat UI with Haha feedback buttons |
+| Chat Frontend | `app/frontend/` | Next.js (TypeScript + Tailwind) chat UI with Haha feedback buttons |
 | Chat Backend | `app/backend/` | FastAPI: serves chat, collects feedback, logs everything |
-| Log Database | `app/backend/laughloop.db` | SQLite storing all interactions + feedback |
+| Interaction Log | `app/backend/logs/interactions.jsonl` | Append-only JSONL log (object-store compatible) |
 | Data Pipeline | `pipeline/` | Exports logged data → training-ready JSONL batches |
 | RL Environment | `environments/laughloop_reward/` | Verifiers environment that loads batches for RL training |
 | Training Config | `configs/rl.toml` | Config for `prime rl run` |
@@ -66,8 +66,8 @@ python server.py  # starts on :8000
 ### 3. Open the frontend
 ```bash
 cd app/frontend
-# Open index.html in browser, or serve with:
-python -m http.server 3000
+npm install
+npm run dev  # starts on :3000
 ```
 
 ### 4. Collect some data
