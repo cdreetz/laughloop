@@ -4,16 +4,22 @@ LaughLoop Backend — FastAPI server for chat + feedback collection.
 Uses append-only JSONL log files instead of SQLite for object-store compatibility.
 
 Endpoints:
-  POST /chat         — Send a message, get a funny response
-  POST /feedback     — Record whether a response was funny (haha or not)
-  GET  /stats        — Get current feedback statistics
-  GET  /interactions — Get all interaction log entries (for log viewer)
-  GET  /pipeline     — Get training pipeline status (batches, training, model version)
-  GET  /health       — Health check (includes current model info)
+  POST /chat             — Send a message, get a funny response
+  POST /feedback         — Record whether a response was funny (haha or not)
+  GET  /stats            — Get current feedback statistics
+  GET  /interactions     — Get all interaction log entries (for log viewer)
+  GET  /pipeline         — Get training pipeline status (batches, training, model version)
+  POST /pipeline/export  — Trigger batch export from interaction logs
+  POST /pipeline/train   — Start an RL training run on Prime
+  POST /pipeline/deploy  — Deploy the latest adapter from a completed run
+  GET  /health           — Health check (includes current model info)
 """
 
+import asyncio
 import json
+import logging
 import os
+import subprocess
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -21,20 +27,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+logger = logging.getLogger("laughloop")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "openai/gpt-4.1-mini")
+MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 BASE_URL = os.getenv("LAUGHLOOP_BASE_URL", "https://api.pinference.ai/api/v1")
 API_KEY = os.getenv("LAUGHLOOP_API_KEY") or os.getenv("PRIME_API_KEY", "")
 ADAPTER_ID = os.getenv("LAUGHLOOP_ADAPTER_ID", "")  # set after first training run
 TEAM_ID = os.getenv("PRIME_TEAM_ID", "")  # required for team accounts on Prime
+PRIME_BASE_URL = os.getenv("PRIME_BASE_URL", "https://api.primeintellect.ai")
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 LOG_DIR = Path(os.getenv("LAUGHLOOP_LOG_DIR", str(Path(__file__).parent / "logs")))
 INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
@@ -372,6 +383,196 @@ async def pipeline_status():
             "adapter_history": _training_state["adapter_history"][-5:],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Action Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _prime_headers() -> dict[str, str]:
+    """Build common headers for Prime API calls."""
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if TEAM_ID:
+        headers["X-Prime-Team-ID"] = TEAM_ID
+    return headers
+
+
+@app.post("/pipeline/export")
+async def pipeline_export():
+    """Trigger batch export from the interaction log."""
+    _training_state["status"] = "exporting"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "python", str(PROJECT_ROOT / "pipeline" / "export_batch.py"),
+                "--log", str(INTERACTIONS_LOG),
+                "--min-batch-size", "1",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+        )
+        _training_state["status"] = "idle"
+
+        if result.returncode != 0:
+            return {
+                "success": False,
+                "error": result.stderr or result.stdout,
+            }
+
+        # Parse output to find the batch file
+        output = result.stdout
+        batch_file = None
+        records_exported = 0
+        for line in output.splitlines():
+            if "Exported" in line and "training records" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "Exported":
+                        try:
+                            records_exported = int(parts[i + 1])
+                        except (IndexError, ValueError):
+                            pass
+            if "Batch ready for training:" in line:
+                batch_file = line.split(":")[-1].strip()
+            if line.startswith("Exported") and "to" in line:
+                batch_file = line.split("to")[-1].strip()
+
+        return {
+            "success": True,
+            "records_exported": records_exported,
+            "batch_file": batch_file,
+            "output": output,
+        }
+    except Exception as e:
+        _training_state["status"] = "idle"
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/pipeline/train")
+async def pipeline_train():
+    """Start an RL training run on Prime."""
+    _training_state["status"] = "training"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "prime", "rl", "run",
+                str(PROJECT_ROOT / "configs" / "rl.toml"),
+                "--plain",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+            env={**os.environ, "PRIME_API_KEY": API_KEY},
+        )
+
+        if result.returncode != 0:
+            _training_state["status"] = "idle"
+            return {
+                "success": False,
+                "error": result.stderr or result.stdout,
+            }
+
+        # Parse run ID from output
+        run_id = None
+        output = result.stdout
+        for line in output.splitlines():
+            if "training/" in line:
+                # URL like https://app.primeintellect.ai/dashboard/training/RUN_ID
+                run_id = line.strip().split("/")[-1]
+                break
+
+        _training_state["current_batch"] = run_id
+        _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
+
+        return {
+            "success": True,
+            "run_id": run_id,
+            "output": output,
+        }
+    except Exception as e:
+        _training_state["status"] = "idle"
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pipeline/runs")
+async def pipeline_runs():
+    """List recent RL training runs from Prime."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/rft/runs",
+                headers=_prime_headers(),
+                params={"page": 1, "limit": 10},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "success": True,
+                "runs": data.get("data", data.get("runs", [])),
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/pipeline/deploy")
+async def pipeline_deploy(run_id: str | None = None):
+    """Deploy the latest adapter from a completed training run."""
+    global ADAPTER_ID
+    _training_state["status"] = "deploying"
+    try:
+        cmd = [
+            "python", str(PROJECT_ROOT / "scripts" / "deploy_adapter.py"),
+        ]
+        if run_id:
+            cmd.extend(["--run-id", run_id])
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(PROJECT_ROOT),
+            env={**os.environ, "PRIME_API_KEY": API_KEY},
+        )
+
+        _training_state["status"] = "idle"
+
+        if result.returncode != 0:
+            return {
+                "success": False,
+                "error": result.stderr or result.stdout,
+            }
+
+        # Try to parse adapter ID from output
+        output = result.stdout
+        for line in output.splitlines():
+            if "LAUGHLOOP_ADAPTER_ID=" in line:
+                adapter_id = line.split("=", 1)[-1].strip()
+                ADAPTER_ID = adapter_id
+                _training_state["model_version"] += 1
+                _training_state["adapter_history"].append({
+                    "version": _training_state["model_version"],
+                    "adapter_id": adapter_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                break
+
+        return {
+            "success": True,
+            "adapter_id": ADAPTER_ID or None,
+            "model_version": _training_state["model_version"],
+            "output": output,
+        }
+    except Exception as e:
+        _training_state["status"] = "idle"
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
