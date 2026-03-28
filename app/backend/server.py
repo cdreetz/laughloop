@@ -59,7 +59,12 @@ _training_state: dict[str, Any] = {
     "last_training_time": None,
     "model_version": 0,  # 0 = base model, increments after each training
     "adapter_history": [],  # list of {version, adapter_id, timestamp, batch_size}
+    "active_run_id": None,  # run ID being monitored by the background watcher
+    "run_status": None,  # latest status from Prime for the active run
 }
+
+# Background task handle for the run watcher
+_run_watcher_task: asyncio.Task | None = None
 
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
@@ -165,6 +170,10 @@ class StatsResponse(BaseModel):
 async def lifespan(app: FastAPI):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
+    # Cancel any running watcher on shutdown
+    global _run_watcher_task
+    if _run_watcher_task and not _run_watcher_task.done():
+        _run_watcher_task.cancel()
 
 
 app = FastAPI(title="LaughLoop", version="0.1.0", lifespan=lifespan)
@@ -374,6 +383,8 @@ async def pipeline_status():
             "current_batch": _training_state["current_batch"],
             "batches_completed": _training_state["batches_completed"],
             "last_training_time": _training_state["last_training_time"],
+            "active_run_id": _training_state["active_run_id"],
+            "run_status": _training_state["run_status"],
         },
         "model": {
             "name": MODEL_NAME,
@@ -491,8 +502,15 @@ async def pipeline_train():
         _training_state["current_batch"] = run_id
         _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
         _training_state["batches_completed"] += 1
-        # Reset to idle — the run is now async on Prime's infra
-        _training_state["status"] = "idle"
+
+        # Start background watcher to monitor run and auto-deploy adapter
+        if run_id:
+            _training_state["active_run_id"] = run_id
+            _training_state["run_status"] = "PENDING"
+            _training_state["status"] = "training"
+            _start_run_watcher(run_id)
+        else:
+            _training_state["status"] = "idle"
 
         return {
             "success": True,
@@ -502,6 +520,162 @@ async def pipeline_train():
     except Exception as e:
         _training_state["status"] = "idle"
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Background Run Watcher — polls Prime, auto-deploys adapter on completion
+# ---------------------------------------------------------------------------
+
+
+def _start_run_watcher(run_id: str):
+    """Kick off a background asyncio task that monitors a training run."""
+    global _run_watcher_task
+    # Cancel any previous watcher
+    if _run_watcher_task and not _run_watcher_task.done():
+        _run_watcher_task.cancel()
+    _run_watcher_task = asyncio.create_task(_watch_run(run_id))
+
+
+async def _watch_run(run_id: str):
+    """Poll Prime API for run status; when COMPLETED, deploy the adapter."""
+    global ADAPTER_ID
+    poll_interval = 30  # seconds between status checks
+    max_polls = 360  # ~3 hours max before giving up
+    logger.info("Run watcher started for %s", run_id)
+
+    try:
+        for _poll_count in range(max_polls):
+            await asyncio.sleep(poll_interval)
+            try:
+                async with httpx.AsyncClient(timeout=30) as http_client:
+                    resp = await http_client.get(
+                        f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
+                        headers=_prime_headers(),
+                    )
+                    resp.raise_for_status()
+                    run_data = resp.json()
+
+                status = run_data.get("status", "UNKNOWN")
+                _training_state["run_status"] = status
+                logger.info("Run %s status: %s", run_id, status)
+
+                if status == "COMPLETED":
+                    logger.info("Run %s completed — deploying adapter", run_id)
+                    _training_state["status"] = "deploying"
+                    await _auto_deploy_adapter(run_id)
+                    return
+
+                if status in ("FAILED", "STOPPED", "CANCELLED"):
+                    logger.warning("Run %s ended with status %s", run_id, status)
+                    _training_state["status"] = "idle"
+                    _training_state["active_run_id"] = None
+                    _training_state["run_status"] = None
+                    return
+
+                # Still running — keep polling
+
+            except Exception:
+                logger.exception("Error polling run %s", run_id)
+                # Keep trying — transient network errors shouldn't kill the watcher
+
+        # Exhausted max polls
+        logger.warning("Run watcher for %s timed out after %d polls", run_id, max_polls)
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
+
+    except asyncio.CancelledError:
+        logger.info("Run watcher for %s cancelled", run_id)
+        return
+
+
+async def _auto_deploy_adapter(run_id: str):
+    """Find the latest adapter for a completed run and deploy it."""
+    global ADAPTER_ID
+    try:
+        # List adapters and find ones matching this run
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/deployments/adapters",
+                headers=_prime_headers(),
+                params={"page": 1, "limit": 50},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        adapters = data.get("data", data.get("adapters", []))
+        matching = [
+            a for a in adapters
+            if a.get("rftRunId") == run_id and a.get("status") == "READY"
+        ]
+
+        if not matching:
+            logger.warning("No READY adapters found for run %s", run_id)
+            _training_state["status"] = "idle"
+            _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
+            return
+
+        # Pick the adapter with the highest step
+        matching.sort(key=lambda a: a.get("step") or 0, reverse=True)
+        adapter = matching[0]
+        adapter_id = adapter["id"]
+        logger.info("Found adapter %s for run %s", adapter_id, run_id)
+
+        # Deploy it
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.post(
+                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}/deploy",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+
+        # Poll deployment status
+        for _ in range(30):  # up to 5 minutes
+            await asyncio.sleep(10)
+            async with httpx.AsyncClient(timeout=30) as http_client:
+                resp = await http_client.get(
+                    f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}",
+                    headers=_prime_headers(),
+                )
+                resp.raise_for_status()
+                adapter_data = resp.json()
+
+            deploy_status = adapter_data.get("deploymentStatus", "")
+            logger.info("Adapter %s deployment status: %s", adapter_id, deploy_status)
+
+            if deploy_status == "DEPLOYED":
+                # Hot-swap the adapter
+                ADAPTER_ID = adapter_id
+                _training_state["model_version"] += 1
+                _training_state["adapter_history"].append({
+                    "version": _training_state["model_version"],
+                    "adapter_id": adapter_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "batch_size": adapter.get("step", 0),
+                })
+                _training_state["status"] = "idle"
+                _training_state["active_run_id"] = None
+                _training_state["run_status"] = None
+                logger.info(
+                    "Adapter %s deployed and hot-swapped — now model v%d",
+                    adapter_id, _training_state["model_version"],
+                )
+                return
+
+            if deploy_status in ("DEPLOY_FAILED", "UNLOADING", "UNLOAD_FAILED"):
+                logger.error("Adapter %s deployment failed: %s", adapter_id, deploy_status)
+                break
+
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
+
+    except Exception:
+        logger.exception("Error auto-deploying adapter for run %s", run_id)
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
 
 
 @app.get("/pipeline/runs")

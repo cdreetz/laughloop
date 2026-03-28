@@ -66,6 +66,8 @@ export interface PipelineResponse {
     current_batch: string | null;
     batches_completed: number;
     last_training_time: string | null;
+    active_run_id: string | null;
+    run_status: string | null;
   };
   model: {
     name: string;
