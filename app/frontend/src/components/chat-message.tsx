@@ -19,26 +19,26 @@ export function ChatMessage({ message, index, onFeedback }: ChatMessageProps) {
 
   return (
     <div
-      className="px-5 animate-[slide-up_0.3s_ease-out_backwards]"
-      style={{ animationDelay: `${Math.min(index * 0.05, 0.2)}s` }}
+      className="px-5 animate-[fade-in_0.2s_ease-out_backwards]"
+      style={{ animationDelay: `${Math.min(index * 0.03, 0.15)}s` }}
     >
       <div
-        className={`flex flex-col mb-2 ${
+        className={`flex flex-col mb-3 ${
           isUser ? "items-end" : "items-start"
         }`}
       >
+        {!isUser && (
+          <span className="mb-1 ml-1 text-[11px] font-medium text-text-dim">
+            LaughLoop
+          </span>
+        )}
         <div
-          className={`max-w-3/4 px-4 py-3 border border-border-custom text-sm leading-relaxed whitespace-pre-wrap ${
+          className={`max-w-3/4 px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap ${
             isUser
-              ? "rounded-2xl rounded-br-sm bg-user-bubble"
-              : "rounded-2xl rounded-bl-sm bg-ai-bubble"
+              ? "rounded-lg bg-foreground text-surface"
+              : "rounded-lg border border-border-custom bg-surface"
           }`}
         >
-          {!isUser && (
-            <span className="mb-1 block text-xs font-semibold text-accent">
-              LaughLoop
-            </span>
-          )}
           {message.content}
         </div>
         {!isUser && message.id && (

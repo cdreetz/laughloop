@@ -7,6 +7,8 @@ Endpoints:
   POST /chat         — Send a message, get a funny response
   POST /feedback     — Record whether a response was funny (haha or not)
   GET  /stats        — Get current feedback statistics
+  GET  /interactions — Get all interaction log entries (for log viewer)
+  GET  /pipeline     — Get training pipeline status (batches, training, model version)
   GET  /health       — Health check (includes current model info)
 """
 
@@ -17,8 +19,9 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -35,6 +38,17 @@ TEAM_ID = os.getenv("PRIME_TEAM_ID", "")  # required for team accounts on Prime
 
 LOG_DIR = Path(os.getenv("LAUGHLOOP_LOG_DIR", str(Path(__file__).parent / "logs")))
 INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
+BATCH_DIR = Path(os.getenv("LAUGHLOOP_BATCH_DIR", str(Path(__file__).parent.parent.parent / "data" / "batches")))
+
+# In-memory training state (would be persisted in production)
+_training_state: dict[str, Any] = {
+    "status": "idle",  # idle | exporting | training | deploying
+    "current_batch": None,
+    "batches_completed": 0,
+    "last_training_time": None,
+    "model_version": 0,  # 0 = base model, increments after each training
+    "adapter_history": [],  # list of {version, adapter_id, timestamp, batch_size}
+}
 
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
@@ -264,6 +278,100 @@ async def stats():
         current_model=MODEL_NAME,
         current_adapter=ADAPTER_ID or "(base model)",
     )
+
+
+@app.get("/interactions")
+async def interactions(
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Get interaction log entries for the log viewer panel."""
+    records = _read_all_interactions()
+    # Return newest first for the log viewer
+    records.reverse()
+    total = len(records)
+    page = records[offset : offset + limit]
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "interactions": page,
+    }
+
+
+def _get_batch_files() -> list[dict]:
+    """Scan the batch directory for exported training batches."""
+    if not BATCH_DIR.exists():
+        return []
+    batches = []
+    for path in sorted(BATCH_DIR.glob("batch_*.jsonl"), reverse=True):
+        if path.name == "latest.jsonl":
+            continue
+        try:
+            with open(path) as fh:
+                line_count = sum(1 for _ in fh)
+            stat = path.stat()
+            batches.append({
+                "filename": path.name,
+                "records": line_count,
+                "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "size_bytes": stat.st_size,
+            })
+        except OSError:
+            continue
+    return batches
+
+
+@app.get("/pipeline")
+async def pipeline_status():
+    """Get training pipeline status for the pipeline visualization panel."""
+    records = _read_all_interactions()
+
+    total = len(records)
+    with_feedback = [r for r in records if r.get("feedback") is not None]
+    unexported = [
+        r for r in records
+        if r.get("exported", 0) == 0 and r.get("feedback") is not None
+    ]
+    exported = [
+        r for r in records
+        if r.get("exported", 0) == 1
+    ]
+
+    batches = _get_batch_files()
+
+    # Determine active model version display
+    model_version = _training_state["model_version"]
+    model_display = f"v{model_version}" if model_version > 0 else "base"
+
+    return {
+        "data_collection": {
+            "total_interactions": total,
+            "labeled": len(with_feedback),
+            "unlabeled": total - len(with_feedback),
+            "unexported": len(unexported),
+            "exported": len(exported),
+        },
+        "batch_queue": {
+            "pending_for_export": len(unexported),
+            "min_batch_size": int(os.getenv("LAUGHLOOP_MIN_BATCH", "20")),
+            "ready_for_export": len(unexported) >= int(os.getenv("LAUGHLOOP_MIN_BATCH", "20")),
+            "batches": batches[:5],  # last 5 batches
+        },
+        "training": {
+            "status": _training_state["status"],
+            "current_batch": _training_state["current_batch"],
+            "batches_completed": _training_state["batches_completed"],
+            "last_training_time": _training_state["last_training_time"],
+        },
+        "model": {
+            "name": MODEL_NAME,
+            "version": model_version,
+            "version_display": model_display,
+            "adapter_id": ADAPTER_ID or None,
+            "adapter_history": _training_state["adapter_history"][-5:],
+        },
+    }
 
 
 @app.get("/health")

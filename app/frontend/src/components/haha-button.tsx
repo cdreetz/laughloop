@@ -35,33 +35,33 @@ export function HahaButton({ interactionId, onFeedback }: HahaButtonProps) {
 
   if (state === "funny") {
     return (
-      <div className="inline-flex items-center gap-1.5 rounded-full border border-funny bg-funny-glow px-3 py-1 text-xs font-semibold text-funny animate-[pop-in_0.3s_ease-out]">
-        Haha!
-      </div>
+      <span className="font-mono text-[11px] text-funny">
+        haha
+      </span>
     );
   }
 
   if (state === "notFunny") {
     return (
-      <div className="inline-flex items-center gap-1.5 rounded-full border border-not-funny bg-not-funny-glow px-3 py-1 text-xs font-semibold text-not-funny">
-        Noted
-      </div>
+      <span className="font-mono text-[11px] text-not-funny">
+        meh
+      </span>
     );
   }
 
   return (
-    <div className="flex gap-1.5 mt-1.5">
+    <div className="flex gap-2">
       <button
         onClick={handleFunny}
-        className="inline-flex items-center gap-1 rounded-full border border-border-custom bg-transparent px-3.5 py-1 text-xs text-text-dim font-sans transition-all duration-200 hover:border-funny hover:text-funny hover:bg-funny-glow cursor-pointer"
+        className="cursor-pointer font-mono text-[11px] text-text-dim transition-colors hover:text-funny"
       >
-        Haha
+        haha
       </button>
       <button
         onClick={handleNotFunny}
-        className="inline-flex items-center gap-1 rounded-full border border-border-custom bg-transparent px-3.5 py-1 text-xs text-text-dim font-sans transition-all duration-200 hover:border-not-funny hover:text-not-funny hover:bg-not-funny-glow cursor-pointer"
+        className="cursor-pointer font-mono text-[11px] text-text-dim transition-colors hover:text-not-funny"
       >
-        Meh
+        meh
       </button>
     </div>
   );

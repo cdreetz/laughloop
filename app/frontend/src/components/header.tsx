@@ -6,34 +6,19 @@ interface HeaderProps {
 
 export function Header({ onNewChat }: HeaderProps) {
   return (
-    <div className="flex items-center gap-3 border-b border-border-custom bg-surface px-5 py-4">
-      <div
-        className="text-3xl leading-none"
-        style={{ animation: "bounce-dot 2s ease-in-out infinite" }}
-      >
-        {"\uD83C\uDFAA"}
-      </div>
+    <div className="flex items-center gap-3 border-b border-border-custom bg-surface px-5 py-3">
       <div>
-        <h1
-          className="font-[family-name:var(--font-playfair)] text-xl font-black leading-tight"
-          style={{
-            background: "linear-gradient(135deg, #f5c542, #ff6b6b, #f5c542)",
-            backgroundSize: "200% 200%",
-            WebkitBackgroundClip: "text",
-            WebkitTextFillColor: "transparent",
-            animation: "gradient-shift 4s ease infinite",
-          }}
-        >
+        <h1 className="text-sm font-semibold tracking-tight text-foreground">
           LaughLoop
         </h1>
-        <p className="mt-0.5 font-mono text-[11px] tracking-wider text-text-dim">
-          CONTINUAL LEARNING COMEDY AI {"\u2014"} GETS FUNNIER OVER TIME
+        <p className="font-mono text-[10px] tracking-wide text-text-dim">
+          online learning demo
         </p>
       </div>
-      <div className="ml-auto flex gap-2">
+      <div className="ml-auto">
         <button
           onClick={onNewChat}
-          className="cursor-pointer rounded-lg border border-border-custom bg-transparent px-3.5 py-1.5 font-mono text-xs text-text-dim transition-all duration-200 hover:border-accent hover:text-accent"
+          className="cursor-pointer rounded border border-border-custom px-3 py-1 font-mono text-[11px] text-text-dim transition-colors hover:border-foreground hover:text-foreground"
         >
           New Chat
         </button>
