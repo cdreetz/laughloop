@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Default paths
@@ -147,7 +147,7 @@ def export_batch(
     # Determine output path
     if output_path is None:
         DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = str(DEFAULT_OUTPUT_DIR / f"batch_{timestamp}.jsonl")
 
     # Write JSONL

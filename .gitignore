@@ -9,3 +9,4 @@ dist/
 .venv/
 outputs/
 app/backend/.adapter_config
+node_modules/

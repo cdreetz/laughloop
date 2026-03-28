@@ -14,7 +14,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -30,6 +30,7 @@ MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "openai/gpt-4.1-mini")
 BASE_URL = os.getenv("LAUGHLOOP_BASE_URL", "https://api.pinference.ai/api/v1")
 API_KEY = os.getenv("LAUGHLOOP_API_KEY") or os.getenv("PRIME_API_KEY", "")
 ADAPTER_ID = os.getenv("LAUGHLOOP_ADAPTER_ID", "")  # set after first training run
+TEAM_ID = os.getenv("PRIME_TEAM_ID", "")  # required for team accounts on Prime
 
 DB_PATH = Path(__file__).parent / "laughloop.db"
 
@@ -143,7 +144,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
+_default_headers = {}
+if TEAM_ID:
+    _default_headers["X-Prime-Team-ID"] = TEAM_ID
+
+client = AsyncOpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    default_headers=_default_headers if _default_headers else None,
+)
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -193,7 +202,7 @@ async def chat(req: ChatRequest):
         (
             interaction_id,
             session_id,
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             req.message,
             assistant_message,
             MODEL_NAME,
@@ -224,7 +233,7 @@ async def feedback(req: FeedbackRequest):
 
     db.execute(
         "UPDATE interactions SET feedback = ?, feedback_timestamp = ? WHERE id = ?",
-        (1 if req.funny else 0, datetime.utcnow().isoformat(), req.interaction_id),
+        (1 if req.funny else 0, datetime.now(timezone.utc).isoformat(), req.interaction_id),
     )
     db.commit()
     db.close()
