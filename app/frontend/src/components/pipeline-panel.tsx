@@ -135,11 +135,25 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
               >
                 {training.status === "training"
                   ? "Training..."
-                  : training.status === "idle"
-                    ? "Idle"
-                    : training.status}
+                  : training.status === "deploying"
+                    ? "Deploying..."
+                    : training.status === "idle"
+                      ? "Idle"
+                      : training.status}
               </span>
             </div>
+            {training.active_run_id && (
+              <div className="space-y-0.5">
+                <p className="font-mono text-[10px] text-text-dim">
+                  Run: {training.active_run_id}
+                </p>
+                {training.run_status && (
+                  <p className="font-mono text-[10px] text-text-dim">
+                    Status: {training.run_status}
+                  </p>
+                )}
+              </div>
+            )}
             {training.last_training_time && (
               <p className="font-mono text-[10px] text-text-dim">
                 Last: {new Date(training.last_training_time).toLocaleString()}
