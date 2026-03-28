@@ -1,0 +1,37 @@
+# LaughLoop RL Training Config
+# Run with: prime rl run configs/rl.toml
+
+# Base model to fine-tune — start with a small, fast model
+model = "Qwen/Qwen3-0.6B"
+
+# Training hyperparameters
+max_steps = 50          # short runs for fast iteration in the continual loop
+batch_size = 64
+rollouts_per_example = 4
+learning_rate = 5e-6
+
+# Sampling config for generation during training
+[sampling]
+max_tokens = 512
+temperature = 0.9       # higher temp = more creative/funny attempts
+
+# Environment: our custom humor feedback environment
+[[env]]
+id = "laughloop-reward"
+args = { data_dir = "./data/batches", data_file = "latest.jsonl" }
+
+# Optional: W&B logging to track humor improvement over training loops
+# [wandb]
+# project = "laughloop"
+# entity = "your-entity"
+# name = "laughloop-loop-001"
+
+# Checkpoint config — save frequently for fast adapter deployment
+[checkpoints]
+interval = 25
+keep_cloud = 3
+
+# Adapter config — upload for deployment
+[adapters]
+interval = 0        # upload only at end of run
+keep_last = 3       # keep last 3 adapters
