@@ -490,6 +490,9 @@ async def pipeline_train():
 
         _training_state["current_batch"] = run_id
         _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
+        _training_state["batches_completed"] += 1
+        # Reset to idle — the run is now async on Prime's infra
+        _training_state["status"] = "idle"
 
         return {
             "success": True,
