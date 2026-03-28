@@ -1,7 +1,7 @@
 """
 LaughLoop Data Pipeline — Export interactions to training-ready JSONL.
 
-Reads from the SQLite log database, exports interactions that have feedback
+Reads from the JSONL interaction log, exports interactions that have feedback
 but haven't been exported yet, and writes them as training-ready JSONL.
 
 Each record contains:
@@ -19,12 +19,15 @@ Usage:
 import argparse
 import json
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 # Default paths
-DEFAULT_DB = Path(__file__).parent.parent / "app" / "backend" / "laughloop.db"
+DEFAULT_LOG_DIR = Path(os.getenv(
+    "LAUGHLOOP_LOG_DIR",
+    str(Path(__file__).parent.parent / "app" / "backend" / "logs"),
+))
+DEFAULT_INTERACTIONS_LOG = DEFAULT_LOG_DIR / "interactions.jsonl"
 DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "data" / "batches"
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
@@ -39,24 +42,36 @@ Rules:
 You're performing live. Every message is a chance to get a laugh. Make it count."""
 
 
-def get_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+def read_interactions(log_path: Path) -> list[dict]:
+    """Read all interaction records from the JSONL log file."""
+    if not log_path.exists():
+        return []
+    records = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
 
 
-def fetch_unexported(db_path: str) -> list[dict]:
+def write_interactions(log_path: Path, records: list[dict]):
+    """Rewrite the entire JSONL log file."""
+    with open(log_path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record, default=str) + "\n")
+
+
+def fetch_unexported(log_path: Path) -> list[dict]:
     """Fetch all interactions with feedback that haven't been exported yet."""
-    db = get_db(db_path)
-    rows = db.execute("""
-        SELECT id, session_id, timestamp, user_message, assistant_message,
-               model, adapter_id, feedback
-        FROM interactions
-        WHERE feedback IS NOT NULL AND exported = 0
-        ORDER BY timestamp ASC
-    """).fetchall()
-    db.close()
-    return [dict(row) for row in rows]
+    records = read_interactions(log_path)
+    return [
+        r for r in records
+        if r.get("feedback") is not None and r.get("exported", 0) == 0
+    ]
 
 
 def build_training_record(interaction: dict, context: list[dict]) -> dict:
@@ -97,20 +112,17 @@ def build_training_record(interaction: dict, context: list[dict]) -> dict:
     }
 
 
-def mark_as_exported(db_path: str, interaction_ids: list[str]):
-    """Mark interactions as exported in the database."""
-    db = get_db(db_path)
-    placeholders = ",".join(["?"] * len(interaction_ids))
-    db.execute(
-        f"UPDATE interactions SET exported = 1 WHERE id IN ({placeholders})",
-        interaction_ids,
-    )
-    db.commit()
-    db.close()
+def mark_as_exported(log_path: Path, interaction_ids: set[str]):
+    """Mark interactions as exported by rewriting the log file."""
+    records = read_interactions(log_path)
+    for record in records:
+        if record.get("id") in interaction_ids:
+            record["exported"] = 1
+    write_interactions(log_path, records)
 
 
 def export_batch(
-    db_path: str,
+    log_path: Path,
     output_path: str | None = None,
     min_batch_size: int = 10,
     mark_exported: bool = True,
@@ -119,7 +131,7 @@ def export_batch(
 
     Returns the output file path, or None if batch was too small.
     """
-    interactions = fetch_unexported(db_path)
+    interactions = fetch_unexported(log_path)
 
     if len(interactions) < min_batch_size:
         print(
@@ -178,8 +190,8 @@ def export_batch(
 
     # Mark as exported
     if mark_exported:
-        ids = [ix["id"] for ix in interactions]
-        mark_as_exported(db_path, ids)
+        ids = {ix["id"] for ix in interactions}
+        mark_as_exported(log_path, ids)
         print(f"  Marked {len(ids)} interactions as exported")
 
     return str(output)
@@ -187,7 +199,10 @@ def export_batch(
 
 def main():
     parser = argparse.ArgumentParser(description="Export LaughLoop training data")
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="Path to SQLite database")
+    parser.add_argument(
+        "--log", default=str(DEFAULT_INTERACTIONS_LOG),
+        help="Path to interactions JSONL log file",
+    )
     parser.add_argument("--output", "-o", default=None, help="Output JSONL file path")
     parser.add_argument(
         "--min-batch-size", type=int, default=10,
@@ -199,13 +214,14 @@ def main():
     )
     args = parser.parse_args()
 
-    if not Path(args.db).exists():
-        print(f"Database not found: {args.db}")
-        print("Start the backend first to create the database.")
+    log_path = Path(args.log)
+    if not log_path.exists():
+        print(f"Interactions log not found: {log_path}")
+        print("Start the backend first or run seed_data.py to create some data.")
         return
 
     result = export_batch(
-        db_path=args.db,
+        log_path=log_path,
         output_path=args.output,
         min_batch_size=args.min_batch_size,
         mark_exported=not args.no_mark,

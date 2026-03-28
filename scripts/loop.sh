@@ -44,7 +44,7 @@ log ""
 log "Step 1: Exporting training data..."
 
 EXPORT_OUTPUT=$(python "${PROJECT_DIR}/pipeline/export_batch.py" \
-    --db "${PROJECT_DIR}/app/backend/laughloop.db" \
+    --log "${PROJECT_DIR}/app/backend/logs/interactions.jsonl" \
     --min-batch-size "$MIN_BATCH_SIZE" 2>&1) || true
 
 echo "$EXPORT_OUTPUT" >> "$LOG_FILE"

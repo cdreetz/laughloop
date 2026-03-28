@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0a0f;
+  --foreground: #e8e8f0;
+  --surface: #13131a;
+  --border: #2a2a3a;
+  --text-dim: #7a7a8e;
+  --accent: #f5c542;
+  --accent-glow: rgba(245, 197, 66, 0.15);
+  --funny: #4ade80;
+  --funny-glow: rgba(74, 222, 128, 0.2);
+  --not-funny: #f87171;
+  --not-funny-glow: rgba(248, 113, 113, 0.15);
+  --user-bubble: #1e1e2e;
+  --ai-bubble: #18182a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-border-custom: var(--border);
+  --color-text-dim: var(--text-dim);
+  --color-accent: var(--accent);
+  --color-accent-glow: var(--accent-glow);
+  --color-funny: var(--funny);
+  --color-funny-glow: var(--funny-glow);
+  --color-not-funny: var(--not-funny);
+  --color-not-funny-glow: var(--not-funny-glow);
+  --color-user-bubble: var(--user-bubble);
+  --color-ai-bubble: var(--ai-bubble);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+@keyframes bounce-dot {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-6px); }
+}
+
+@keyframes pop-in {
+  0% { transform: scale(0.8); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}

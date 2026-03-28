@@ -4,6 +4,8 @@ LaughLoop Seed Data — Generate synthetic training data for pipeline testing.
 Creates fake interactions with humor feedback so you can test the full
 training loop without needing real users.
 
+Uses JSONL log files instead of SQLite for object-store compatibility.
+
 Usage:
   python pipeline/seed_data.py              # Generate 100 seed interactions
   python pipeline/seed_data.py --count 200  # Generate 200
@@ -11,13 +13,17 @@ Usage:
 
 import argparse
 import json
+import os
 import random
-import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "app" / "backend" / "laughloop.db"
+LOG_DIR = Path(os.getenv(
+    "LAUGHLOOP_LOG_DIR",
+    str(Path(__file__).parent.parent / "app" / "backend" / "logs"),
+))
+INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
 
 FUNNY_EXCHANGES = [
     ("Tell me a joke", "I told my wifi we needed to talk. Now it won't connect. Typical.", 1),
@@ -46,31 +52,9 @@ NOT_FUNNY_EXCHANGES = [
     ("Tell me something funny", "Humor is subjective and varies across cultures and individuals.", 0),
 ]
 
-def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS interactions (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            user_message TEXT NOT NULL,
-            assistant_message TEXT NOT NULL,
-            model TEXT NOT NULL,
-            adapter_id TEXT DEFAULT '',
-            feedback INTEGER DEFAULT NULL,
-            feedback_timestamp TEXT DEFAULT NULL,
-            exported INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_interactions_exported ON interactions(exported)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions(session_id)")
-    conn.commit()
-    return conn
-
 
 def seed(count: int = 100):
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = init_db()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     all_exchanges = FUNNY_EXCHANGES + NOT_FUNNY_EXCHANGES
     base_time = datetime.now(timezone.utc) - timedelta(hours=count)
@@ -78,45 +62,38 @@ def seed(count: int = 100):
     inserted = 0
     session_id = str(uuid.uuid4())
 
-    for i in range(count):
-        exchange = random.choice(all_exchanges)
-        user_msg, ai_msg, feedback = exchange
+    with open(INTERACTIONS_LOG, "a") as f:
+        for i in range(count):
+            exchange = random.choice(all_exchanges)
+            user_msg, ai_msg, feedback = exchange
 
-        # Occasionally add some variation
-        if random.random() < 0.3:
-            user_msg = user_msg + " " + random.choice(["please", "lol", "haha", "seriously", "??"])
+            # Occasionally add some variation
+            if random.random() < 0.3:
+                user_msg = user_msg + " " + random.choice(["please", "lol", "haha", "seriously", "??"])
 
-        # New session every ~5 messages
-        if i % 5 == 0:
-            session_id = str(uuid.uuid4())
+            # New session every ~5 messages
+            if i % 5 == 0:
+                session_id = str(uuid.uuid4())
 
-        timestamp = (base_time + timedelta(minutes=i * 3)).isoformat()
-        feedback_ts = (base_time + timedelta(minutes=i * 3 + 1)).isoformat()
+            timestamp = (base_time + timedelta(minutes=i * 3)).isoformat()
+            feedback_ts = (base_time + timedelta(minutes=i * 3 + 1)).isoformat()
 
-        conn.execute(
-            "INSERT OR IGNORE INTO interactions "
-            "(id, session_id, timestamp, user_message, assistant_message, "
-            "model, adapter_id, feedback, feedback_timestamp, exported) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-            (
-                str(uuid.uuid4()),
-                session_id,
-                timestamp,
-                user_msg,
-                ai_msg,
-                "seed-model",
-                "",
-                feedback,
-                feedback_ts,
-            ),
-        )
-        inserted += 1
+            record = {
+                "id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "timestamp": timestamp,
+                "user_message": user_msg,
+                "assistant_message": ai_msg,
+                "model": "seed-model",
+                "adapter_id": "",
+                "feedback": feedback,
+                "feedback_timestamp": feedback_ts,
+                "exported": 0,
+            }
+            f.write(json.dumps(record) + "\n")
+            inserted += 1
 
-    conn.commit()
-    conn.close()
-
-    funny_count = sum(1 for _ in range(count) if random.choice(all_exchanges)[2] == 1)
-    print(f"Seeded {inserted} interactions into {DB_PATH}")
+    print(f"Seeded {inserted} interactions into {INTERACTIONS_LOG}")
     print(f"  ~{len(FUNNY_EXCHANGES)/(len(all_exchanges))*100:.0f}% funny rate in seed data")
 
 

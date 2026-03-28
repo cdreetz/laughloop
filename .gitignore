@@ -10,3 +10,5 @@ dist/
 outputs/
 app/backend/.adapter_config
 node_modules/
+.next/
+app/backend/logs/

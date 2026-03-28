@@ -1,6 +1,8 @@
 """
 LaughLoop Backend — FastAPI server for chat + feedback collection.
 
+Uses append-only JSONL log files instead of SQLite for object-store compatibility.
+
 Endpoints:
   POST /chat         — Send a message, get a funny response
   POST /feedback     — Record whether a response was funny (haha or not)
@@ -10,8 +12,7 @@ Endpoints:
 
 import json
 import os
-import sqlite3
-import time
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -32,7 +33,8 @@ API_KEY = os.getenv("LAUGHLOOP_API_KEY") or os.getenv("PRIME_API_KEY", "")
 ADAPTER_ID = os.getenv("LAUGHLOOP_ADAPTER_ID", "")  # set after first training run
 TEAM_ID = os.getenv("PRIME_TEAM_ID", "")  # required for team accounts on Prime
 
-DB_PATH = Path(__file__).parent / "laughloop.db"
+LOG_DIR = Path(os.getenv("LAUGHLOOP_LOG_DIR", str(Path(__file__).parent / "logs")))
+INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
 
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
@@ -48,43 +50,49 @@ You're performing live. Every message is a chance to get a laugh. Make it count.
 
 
 # ---------------------------------------------------------------------------
-# Database
+# JSONL Log Storage
 # ---------------------------------------------------------------------------
 
-
-def init_db():
-    """Initialize SQLite database for interaction logging."""
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS interactions (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            user_message TEXT NOT NULL,
-            assistant_message TEXT NOT NULL,
-            model TEXT NOT NULL,
-            adapter_id TEXT DEFAULT '',
-            feedback INTEGER DEFAULT NULL,
-            feedback_timestamp TEXT DEFAULT NULL,
-            exported INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_interactions_exported
-        ON interactions(exported)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_interactions_session
-        ON interactions(session_id)
-    """)
-    conn.commit()
-    conn.close()
+# Thread lock for safe appends from concurrent requests
+_log_lock = threading.Lock()
 
 
-def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+def _append_log(record: dict):
+    """Append a single JSON record to the interactions log."""
+    with _log_lock:
+        with open(INTERACTIONS_LOG, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+
+def _read_all_interactions() -> list[dict]:
+    """Read all interaction records from the log file."""
+    if not INTERACTIONS_LOG.exists():
+        return []
+    records = []
+    with open(INTERACTIONS_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
+
+
+def _rewrite_log(records: list[dict]):
+    """Rewrite the entire log file (used for updates like feedback)."""
+    with _log_lock:
+        with open(INTERACTIONS_LOG, "w") as f:
+            for record in records:
+                f.write(json.dumps(record, default=str) + "\n")
+
+
+def _get_session_history(session_id: str, limit: int = 10) -> list[dict]:
+    """Get the last N interactions for a session."""
+    all_records = _read_all_interactions()
+    session_records = [r for r in all_records if r.get("session_id") == session_id]
+    return session_records[-limit:]
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +138,7 @@ class StatsResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
 
 
@@ -162,16 +170,10 @@ async def chat(req: ChatRequest):
     interaction_id = str(uuid.uuid4())
 
     # Load conversation history for this session (last 10 turns)
-    db = get_db()
-    rows = db.execute(
-        "SELECT user_message, assistant_message FROM interactions "
-        "WHERE session_id = ? ORDER BY timestamp DESC LIMIT 10",
-        (session_id,),
-    ).fetchall()
-    db.close()
+    history = _get_session_history(session_id, limit=10)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for row in reversed(rows):
+    for row in history:
         messages.append({"role": "user", "content": row["user_message"]})
         messages.append({"role": "assistant", "content": row["assistant_message"]})
     messages.append({"role": "user", "content": req.message})
@@ -194,23 +196,20 @@ async def chat(req: ChatRequest):
         # Fallback: still log the attempt
         assistant_message = f"My comedy circuits are overloaded right now. (Error: {e})"
 
-    # Log to database
-    db = get_db()
-    db.execute(
-        "INSERT INTO interactions (id, session_id, timestamp, user_message, "
-        "assistant_message, model, adapter_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            interaction_id,
-            session_id,
-            datetime.now(timezone.utc).isoformat(),
-            req.message,
-            assistant_message,
-            MODEL_NAME,
-            ADAPTER_ID,
-        ),
-    )
-    db.commit()
-    db.close()
+    # Log to JSONL file
+    record = {
+        "id": interaction_id,
+        "session_id": session_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_message": req.message,
+        "assistant_message": assistant_message,
+        "model": MODEL_NAME,
+        "adapter_id": ADAPTER_ID,
+        "feedback": None,
+        "feedback_timestamp": None,
+        "exported": 0,
+    }
+    _append_log(record)
 
     return ChatResponse(
         id=interaction_id,
@@ -222,49 +221,42 @@ async def chat(req: ChatRequest):
 @app.post("/feedback", response_model=FeedbackResponse)
 async def feedback(req: FeedbackRequest):
     """Record user feedback (funny or not) for an interaction."""
-    db = get_db()
-    row = db.execute(
-        "SELECT id FROM interactions WHERE id = ?", (req.interaction_id,)
-    ).fetchone()
+    records = _read_all_interactions()
 
-    if not row:
-        db.close()
+    found = False
+    for record in records:
+        if record.get("id") == req.interaction_id:
+            record["feedback"] = 1 if req.funny else 0
+            record["feedback_timestamp"] = datetime.now(timezone.utc).isoformat()
+            found = True
+            break
+
+    if not found:
         raise HTTPException(status_code=404, detail="Interaction not found")
 
-    db.execute(
-        "UPDATE interactions SET feedback = ?, feedback_timestamp = ? WHERE id = ?",
-        (1 if req.funny else 0, datetime.now(timezone.utc).isoformat(), req.interaction_id),
-    )
-    db.commit()
-    db.close()
-
+    _rewrite_log(records)
     return FeedbackResponse(success=True)
 
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats():
     """Get current feedback statistics."""
-    db = get_db()
-    total = db.execute("SELECT COUNT(*) FROM interactions").fetchone()[0]
-    with_feedback = db.execute(
-        "SELECT COUNT(*) FROM interactions WHERE feedback IS NOT NULL"
-    ).fetchone()[0]
-    funny = db.execute(
-        "SELECT COUNT(*) FROM interactions WHERE feedback = 1"
-    ).fetchone()[0]
-    not_funny = db.execute(
-        "SELECT COUNT(*) FROM interactions WHERE feedback = 0"
-    ).fetchone()[0]
-    unexported = db.execute(
-        "SELECT COUNT(*) FROM interactions WHERE exported = 0 AND feedback IS NOT NULL"
-    ).fetchone()[0]
-    db.close()
+    records = _read_all_interactions()
 
-    haha_rate = funny / with_feedback if with_feedback > 0 else 0.0
+    total = len(records)
+    with_feedback = [r for r in records if r.get("feedback") is not None]
+    funny = sum(1 for r in with_feedback if r["feedback"] == 1)
+    not_funny = sum(1 for r in with_feedback if r["feedback"] == 0)
+    unexported = sum(
+        1 for r in records
+        if r.get("exported", 0) == 0 and r.get("feedback") is not None
+    )
+
+    haha_rate = funny / len(with_feedback) if with_feedback else 0.0
 
     return StatsResponse(
         total_interactions=total,
-        total_feedback=with_feedback,
+        total_feedback=len(with_feedback),
         funny_count=funny,
         not_funny_count=not_funny,
         haha_rate=round(haha_rate, 4),
@@ -280,7 +272,7 @@ async def health():
         "status": "ok",
         "model": MODEL_NAME,
         "adapter": ADAPTER_ID or None,
-        "db_path": str(DB_PATH),
+        "log_dir": str(LOG_DIR),
     }
 
 
