@@ -7,6 +7,8 @@ import { ChatMessage, type Message } from "@/components/chat-message";
 import { ChatInput } from "@/components/chat-input";
 import { EmptyState } from "@/components/empty-state";
 import { TypingIndicator } from "@/components/typing-indicator";
+import { LogViewer } from "@/components/log-viewer";
+import { PipelinePanel } from "@/components/pipeline-panel";
 import { sendChat, fetchStats as apiFetchStats, type Stats } from "@/lib/api";
 
 export default function Home() {
@@ -15,6 +17,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const refreshStats = useCallback(async () => {
@@ -48,6 +51,10 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
+  const triggerRefresh = useCallback(() => {
+    setRefreshKey((k) => k + 1);
+  }, []);
+
   const send = async () => {
     const text = input.trim();
     if (!text || loading) return;
@@ -68,6 +75,7 @@ export default function Home() {
       };
       setMessages((prev) => [...prev, aiMsg]);
       refreshStats();
+      triggerRefresh();
     } catch {
       setMessages((prev) => [
         ...prev,
@@ -83,7 +91,10 @@ export default function Home() {
   };
 
   const handleFeedback = () => {
-    setTimeout(refreshStats, 500);
+    setTimeout(() => {
+      refreshStats();
+      triggerRefresh();
+    }, 500);
   };
 
   const handleNewChat = () => {
@@ -94,33 +105,52 @@ export default function Home() {
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
       <Header onNewChat={handleNewChat} />
-      <StatsBar stats={stats} />
 
-      <div className="flex-1 overflow-y-auto py-4">
-        {messages.length === 0 ? (
-          <EmptyState onSelectPrompt={setInput} />
-        ) : (
-          <>
-            {messages.map((msg, i) => (
-              <ChatMessage
-                key={i}
-                message={msg}
-                index={i}
-                onFeedback={handleFeedback}
-              />
-            ))}
-          </>
-        )}
-        {loading && <TypingIndicator />}
-        <div ref={bottomRef} />
+      <div className="flex min-h-0 flex-1">
+        {/* Left: Chat Panel */}
+        <div className="flex w-1/2 flex-col border-r border-border-custom">
+          <StatsBar stats={stats} />
+
+          <div className="flex-1 overflow-y-auto py-4">
+            {messages.length === 0 ? (
+              <EmptyState onSelectPrompt={setInput} />
+            ) : (
+              <>
+                {messages.map((msg, i) => (
+                  <ChatMessage
+                    key={i}
+                    message={msg}
+                    index={i}
+                    onFeedback={handleFeedback}
+                  />
+                ))}
+              </>
+            )}
+            {loading && <TypingIndicator />}
+            <div ref={bottomRef} />
+          </div>
+
+          <ChatInput
+            value={input}
+            onChange={setInput}
+            onSend={send}
+            loading={loading}
+          />
+        </div>
+
+        {/* Right: Log Viewer + Pipeline */}
+        <div className="flex w-1/2 flex-col">
+          {/* Top-right: Log Viewer */}
+          <div className="flex-1 overflow-hidden border-b border-border-custom">
+            <LogViewer refreshKey={refreshKey} />
+          </div>
+
+          {/* Bottom-right: Training Pipeline */}
+          <div className="flex-1 overflow-hidden">
+            <PipelinePanel refreshKey={refreshKey} />
+          </div>
+        </div>
       </div>
-
-      <ChatInput
-        value={input}
-        onChange={setInput}
-        onSend={send}
-        loading={loading}
-      />
     </div>
   );
 }
