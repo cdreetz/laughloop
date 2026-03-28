@@ -569,6 +569,7 @@ async def _watch_run(run_id: str):
                     logger.warning("Run %s ended with status %s", run_id, status)
                     _training_state["status"] = "idle"
                     _training_state["active_run_id"] = None
+                    _training_state["run_status"] = None
                     return
 
                 # Still running — keep polling
@@ -581,6 +582,7 @@ async def _watch_run(run_id: str):
         logger.warning("Run watcher for %s timed out after %d polls", run_id, max_polls)
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
 
     except asyncio.CancelledError:
         logger.info("Run watcher for %s cancelled", run_id)
@@ -611,6 +613,7 @@ async def _auto_deploy_adapter(run_id: str):
             logger.warning("No READY adapters found for run %s", run_id)
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
             return
 
         # Pick the adapter with the highest step
@@ -653,6 +656,7 @@ async def _auto_deploy_adapter(run_id: str):
                 })
                 _training_state["status"] = "idle"
                 _training_state["active_run_id"] = None
+                _training_state["run_status"] = None
                 logger.info(
                     "Adapter %s deployed and hot-swapped — now model v%d",
                     adapter_id, _training_state["model_version"],
@@ -665,11 +669,13 @@ async def _auto_deploy_adapter(run_id: str):
 
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
 
     except Exception:
         logger.exception("Error auto-deploying adapter for run %s", run_id)
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
 
 
 @app.get("/pipeline/runs")
