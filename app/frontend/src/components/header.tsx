@@ -27,7 +27,7 @@ export function Header({ onNewChat }: HeaderProps) {
           LaughLoop
         </h1>
         <p className="mt-0.5 font-mono text-[11px] tracking-wider text-text-dim">
-          CONTINUAL LEARNING COMEDY AI \u2014 GETS FUNNIER OVER TIME
+          CONTINUAL LEARNING COMEDY AI {"\u2014"} GETS FUNNIER OVER TIME
         </p>
       </div>
       <div className="ml-auto flex gap-2">

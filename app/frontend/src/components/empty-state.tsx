@@ -23,7 +23,7 @@ export function EmptyState({ onSelectPrompt }: EmptyStateProps) {
         <br />
         Click{" "}
         <strong className="text-funny">Haha</strong> if I
-        land the joke \u2014 it helps me learn!
+        land the joke {"\u2014"} it helps me learn!
       </p>
       <div className="mt-2 flex flex-wrap justify-center gap-2">
         {PROMPTS.map((prompt) => (
