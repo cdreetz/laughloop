@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -474,22 +475,53 @@ def _prime_headers() -> dict[str, str]:
     return headers
 
 
+def _sync_r2_to_tempfile() -> str:
+    """Download R2 log to a temp file. Returns the temp file path."""
+    content = _r2_read_log()
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False,
+    )
+    tmp.write(content)
+    tmp.close()
+    return tmp.name
+
+
+def _sync_tempfile_to_r2(tmp_path: str):
+    """Upload modified temp file back to R2 (for exported marks)."""
+    with open(tmp_path) as f:
+        content = f.read()
+    _r2_write_log(content)
+
+
 @app.post("/pipeline/export")
 async def pipeline_export():
     """Trigger batch export from the interaction log."""
     _training_state["status"] = "exporting"
+    tmp_path: str | None = None
     try:
+        # When using R2, dump log to a temp file so the subprocess can read it
+        if USE_R2:
+            tmp_path = await asyncio.to_thread(_sync_r2_to_tempfile)
+            log_arg = tmp_path
+        else:
+            log_arg = str(INTERACTIONS_LOG)
+
         result = await asyncio.to_thread(
             subprocess.run,
             [
                 "python", str(PROJECT_ROOT / "pipeline" / "export_batch.py"),
-                "--log", str(INTERACTIONS_LOG),
+                "--log", log_arg,
                 "--min-batch-size", "1",
             ],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
         )
+
+        # Sync exported marks back to R2 if applicable
+        if USE_R2 and tmp_path and result.returncode == 0:
+            await asyncio.to_thread(_sync_tempfile_to_r2, tmp_path)
+
         _training_state["status"] = "idle"
 
         if result.returncode != 0:
@@ -525,6 +557,13 @@ async def pipeline_export():
     except Exception as e:
         _training_state["status"] = "idle"
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.post("/pipeline/train")
