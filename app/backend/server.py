@@ -1753,12 +1753,14 @@ async def trigger_eval_run(
 
     # On long-lived servers, use background task
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         has_background = not os.getenv("VERCEL")
     except RuntimeError:
         has_background = False
 
     if has_background:
+        _training_state["eval_status"] = "running"
+        _save_pipeline_state()
         _start_eval_watcher(model_name, model_version, adapter_id)
         return {
             "success": True,
