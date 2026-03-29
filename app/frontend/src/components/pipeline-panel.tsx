@@ -19,21 +19,58 @@ function ProgressBar({ value, max }: { value: number; max: number }) {
   );
 }
 
+function PulsingDot({ active }: { active: boolean }) {
+  if (!active) return null;
+  return (
+    <span className="relative ml-1.5 inline-flex h-1.5 w-1.5">
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-foreground opacity-50" />
+      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-foreground" />
+    </span>
+  );
+}
+
+function Spinner() {
+  return (
+    <span className="inline-block h-3 w-3 animate-spin rounded-full border border-foreground border-t-transparent" />
+  );
+}
+
 function Stage({
   label,
+  active,
   children,
 }: {
   label: string;
+  active?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="space-y-2">
-      <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-text-dim">
-        {label}
-      </span>
+    <div
+      className={`space-y-2 rounded-md border px-3 py-2 ${
+        active
+          ? "border-foreground/20 bg-foreground/[0.02]"
+          : "border-transparent"
+      }`}
+    >
+      <div className="flex items-center">
+        <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-text-dim">
+          {label}
+        </span>
+        <PulsingDot active={!!active} />
+      </div>
       {children}
     </div>
   );
+}
+
+function formatTimeAgo(isoString: string): string {
+  const diff = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
 
 export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
@@ -60,7 +97,9 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
   if (!pipeline) return null;
 
   const { data_collection, batch_queue, training, model } = pipeline;
-  const isTraining = training.status !== "idle";
+  const isExporting = training.status === "exporting";
+  const isTraining = training.status === "training";
+  const isDeploying = training.status === "deploying";
 
   return (
     <div className="flex h-full flex-col">
@@ -73,15 +112,26 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
         </span>
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto p-3">
-        <Stage label="1. Collect Feedback">
+      <div className="flex-1 space-y-2 overflow-y-auto p-3">
+        {/* Stage 1: Collect Feedback */}
+        <Stage
+          label="1. Collect Feedback"
+          active={training.status === "idle" && !batch_queue.ready_for_export}
+        >
           <div className="space-y-1.5">
             <div className="flex justify-between font-mono text-[11px]">
               <span className="text-text-dim">
-                {data_collection.unexported} / {batch_queue.min_batch_size} labeled
+                {data_collection.unexported} / {batch_queue.min_batch_size}{" "}
+                labeled
               </span>
-              <span className="text-text-dim">
-                {batch_queue.ready_for_export ? "Ready" : "Collecting"}
+              <span
+                className={
+                  batch_queue.ready_for_export
+                    ? "text-foreground"
+                    : "text-text-dim"
+                }
+              >
+                {batch_queue.ready_for_export ? "Ready to export" : "Collecting"}
               </span>
             </div>
             <ProgressBar
@@ -96,7 +146,14 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
           </div>
         </Stage>
 
-        <Stage label="2. Export Batch">
+        {/* Stage 2: Export Batch */}
+        <Stage label="2. Export Batch" active={isExporting}>
+          {isExporting && (
+            <div className="flex items-center gap-2 font-mono text-[11px] text-foreground">
+              <Spinner />
+              Exporting batch...
+            </div>
+          )}
           {batch_queue.batches.length > 0 ? (
             <div className="space-y-1">
               {batch_queue.batches.slice(0, 3).map((batch) => (
@@ -108,27 +165,31 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
                     {batch.filename}
                   </span>
                   <span className="ml-2 shrink-0 text-text-dim">
-                    {batch.records} records
+                    {batch.size_bytes > 0
+                      ? `${(batch.size_bytes / 1024).toFixed(0)} KB`
+                      : `${batch.records} records`}
                   </span>
                 </div>
               ))}
             </div>
-          ) : (
+          ) : !isExporting ? (
             <p className="font-mono text-[10px] text-text-dim">
               No batches yet
             </p>
-          )}
+          ) : null}
         </Stage>
 
-        <Stage label="3. RL Training">
-          <div className="space-y-1">
+        {/* Stage 3: RL Training */}
+        <Stage label="3. RL Training" active={isTraining}>
+          <div className="space-y-1.5">
             <div className="flex justify-between font-mono text-[11px]">
               <span className="text-text-dim">
-                {training.batches_completed} runs
+                {training.batches_completed} run
+                {training.batches_completed !== 1 ? "s" : ""}
               </span>
               <span
                 className={
-                  isTraining
+                  isTraining || isDeploying || isExporting
                     ? "text-foreground"
                     : "text-text-dim"
                 }
@@ -137,11 +198,43 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
                   ? "Training..."
                   : training.status === "deploying"
                     ? "Deploying..."
-                    : training.status === "idle"
-                      ? "Idle"
-                      : training.status}
+                    : training.status === "exporting"
+                      ? "Exporting..."
+                      : training.status === "idle"
+                        ? "Idle"
+                        : training.status}
               </span>
             </div>
+
+            {/* Training progress bar */}
+            {isTraining && training.run_progress && (
+              <div className="space-y-1">
+                <ProgressBar
+                  value={training.run_progress.latest_step}
+                  max={training.run_progress.max_steps}
+                />
+                <div className="flex justify-between font-mono text-[10px] text-text-dim">
+                  <span>
+                    Step {training.run_progress.latest_step} /{" "}
+                    {training.run_progress.max_steps}
+                  </span>
+                  {training.run_progress.last_updated_at && (
+                    <span>
+                      {formatTimeAgo(training.run_progress.last_updated_at)}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Spinner when training but no progress yet */}
+            {isTraining && !training.run_progress && (
+              <div className="flex items-center gap-2 font-mono text-[10px] text-text-dim">
+                <Spinner />
+                Waiting for first step...
+              </div>
+            )}
+
             {training.active_run_id && (
               <div className="space-y-0.5">
                 <p className="font-mono text-[10px] text-text-dim">
@@ -162,7 +255,14 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
           </div>
         </Stage>
 
-        <Stage label="4. Deploy Adapter">
+        {/* Stage 4: Deploy Adapter */}
+        <Stage label="4. Deploy Adapter" active={isDeploying}>
+          {isDeploying && (
+            <div className="flex items-center gap-2 font-mono text-[11px] text-foreground">
+              <Spinner />
+              Deploying adapter...
+            </div>
+          )}
           <div className="space-y-1">
             <div className="flex items-center justify-between font-mono text-[11px]">
               <span className="text-text-dim">Active:</span>
@@ -182,7 +282,8 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
                     key={i}
                     className="font-mono text-[10px] text-text-dim"
                   >
-                    v{h.version}: {h.adapter_id.slice(0, 12)}... ({h.batch_size} samples)
+                    v{h.version}: {h.adapter_id.slice(0, 12)}... (
+                    {h.batch_size} samples)
                   </div>
                 ))}
               </div>
