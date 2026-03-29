@@ -90,6 +90,7 @@ _DEFAULT_TRAINING_STATE: dict[str, Any] = {
     "adapter_history": [],  # list of {version, adapter_id, timestamp, batch_size}
     "active_run_id": None,  # run ID being monitored by the background watcher
     "run_status": None,  # latest status from Prime for the active run
+    "deploying_adapter_id": None,  # adapter ID being deployed (for lazy-poll)
 }
 
 _training_state: dict[str, Any] = {**_DEFAULT_TRAINING_STATE}
@@ -477,9 +478,11 @@ async def pipeline_status():
     On serverless (Vercel), also lazy-polls the active training run so the
     frontend sees up-to-date status without background tasks.
     """
-    # Lazy-poll: if there's an active run, check its status via Prime API
+    # Lazy-poll: if there's an active run or deployment, check status via Prime API
     if _training_state["active_run_id"] and _training_state["status"] == "training":
         await _lazy_poll_run(_training_state["active_run_id"])
+    elif _training_state["status"] == "deploying" and _training_state.get("deploying_adapter_id"):
+        await _lazy_poll_deploy(_training_state["deploying_adapter_id"])
 
     records = _read_all_interactions()
 
@@ -808,8 +811,10 @@ async def _lazy_poll_run(run_id: str):
         if status == "COMPLETED":
             _training_state["status"] = "deploying"
             _save_pipeline_state()
-            # Fire-and-forget so GET /pipeline returns immediately
-            asyncio.create_task(_auto_deploy_adapter(run_id))
+            # Kick off adapter discovery + deploy request (non-blocking).
+            # The actual deployment polling is handled by _lazy_poll_deploy
+            # on subsequent GET /pipeline requests.
+            asyncio.create_task(_start_adapter_deploy(run_id))
 
         elif status in ("FAILED", "STOPPED", "CANCELLED"):
             _training_state["status"] = "idle"
@@ -824,14 +829,13 @@ async def _lazy_poll_run(run_id: str):
         logger.exception("Lazy poll failed for run %s", run_id)
 
 
-async def _auto_deploy_adapter(run_id: str) -> bool:
-    """Find the latest adapter for a completed run and deploy it.
+async def _start_adapter_deploy(run_id: str):
+    """Find the best adapter for a completed run and issue the deploy request.
 
-    Returns True if an adapter was successfully deployed, False otherwise.
+    Stores `deploying_adapter_id` in state so _lazy_poll_deploy can track it
+    on subsequent GET /pipeline requests.  Does NOT poll — returns quickly.
     """
-    global ADAPTER_ID
     try:
-        # List adapters and find ones matching this run
         async with httpx.AsyncClient(timeout=30) as http_client:
             resp = await http_client.get(
                 f"{PRIME_BASE_URL}/api/v1/deployments/adapters",
@@ -852,10 +856,121 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
             _training_state["run_status"] = None
+            _training_state["deploying_adapter_id"] = None
+            _save_pipeline_state()
+            return
+
+        matching.sort(key=lambda a: a.get("step") or 0, reverse=True)
+        adapter = matching[0]
+        adapter_id = adapter["id"]
+        logger.info("Found adapter %s for run %s — issuing deploy request", adapter_id, run_id)
+
+        # Issue deploy request
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.post(
+                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}/deploy",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+
+        # Save adapter ID so lazy-poll can track deployment progress
+        _training_state["deploying_adapter_id"] = adapter_id
+        _save_pipeline_state()
+        logger.info("Deploy request sent for adapter %s — lazy-poll will track it", adapter_id)
+
+    except Exception:
+        logger.exception("Error starting adapter deploy for run %s", run_id)
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
+        _training_state["deploying_adapter_id"] = None
+        _save_pipeline_state()
+
+
+async def _lazy_poll_deploy(adapter_id: str):
+    """Single-shot poll of adapter deployment status — called from GET /pipeline
+    when status is 'deploying'.  Returns quickly.
+    """
+    global ADAPTER_ID
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+            adapter_data = resp.json()
+
+        deploy_status = adapter_data.get("deploymentStatus", "")
+        logger.info("Lazy-poll deploy: adapter %s status=%s", adapter_id, deploy_status)
+
+        if deploy_status == "DEPLOYED":
+            ADAPTER_ID = adapter_id
+            _training_state["model_version"] += 1
+            _training_state["adapter_history"].append({
+                "version": _training_state["model_version"],
+                "adapter_id": adapter_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            _training_state["status"] = "idle"
+            _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
+            _training_state["deploying_adapter_id"] = None
+            _save_pipeline_state()
+            logger.info(
+                "Adapter %s deployed and hot-swapped — now model v%d",
+                adapter_id, _training_state["model_version"],
+            )
+
+        elif deploy_status in ("DEPLOY_FAILED", "UNLOADING", "UNLOAD_FAILED"):
+            logger.error("Adapter %s deployment failed: %s", adapter_id, deploy_status)
+            _training_state["status"] = "idle"
+            _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
+            _training_state["deploying_adapter_id"] = None
+            _save_pipeline_state()
+
+        # else: still deploying — state unchanged, next poll will check again
+
+    except Exception:
+        logger.exception("Lazy-poll deploy failed for adapter %s", adapter_id)
+
+
+async def _auto_deploy_adapter(run_id: str) -> bool:
+    """Find the latest adapter for a completed run and deploy it.
+
+    Used by the background watcher on long-lived servers and by the
+    POST /pipeline/deploy endpoint.  On serverless, prefer
+    _start_adapter_deploy + _lazy_poll_deploy instead.
+
+    Returns True if an adapter was successfully deployed, False otherwise.
+    """
+    global ADAPTER_ID
+    try:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/deployments/adapters",
+                headers=_prime_headers(),
+                params={"page": 1, "limit": 50},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        adapters = data.get("data", data.get("adapters", []))
+        matching = [
+            a for a in adapters
+            if a.get("rftRunId") == run_id and a.get("status") == "READY"
+        ]
+
+        if not matching:
+            logger.warning("No READY adapters found for run %s", run_id)
+            _training_state["status"] = "idle"
+            _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
+            _training_state["deploying_adapter_id"] = None
             _save_pipeline_state()
             return False
 
-        # Pick the adapter with the highest step
         matching.sort(key=lambda a: a.get("step") or 0, reverse=True)
         adapter = matching[0]
         adapter_id = adapter["id"]
@@ -869,7 +984,10 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
             )
             resp.raise_for_status()
 
-        # Poll deployment status (up to 5 minutes)
+        _training_state["deploying_adapter_id"] = adapter_id
+        _save_pipeline_state()
+
+        # Poll deployment status (up to 5 minutes) — only on long-lived servers
         for _ in range(30):
             await asyncio.sleep(10)
             async with httpx.AsyncClient(timeout=30) as http_client:
@@ -884,7 +1002,6 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
             logger.info("Adapter %s deployment status: %s", adapter_id, deploy_status)
 
             if deploy_status == "DEPLOYED":
-                # Hot-swap the adapter
                 ADAPTER_ID = adapter_id
                 _training_state["model_version"] += 1
                 _training_state["adapter_history"].append({
@@ -896,6 +1013,7 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
                 _training_state["status"] = "idle"
                 _training_state["active_run_id"] = None
                 _training_state["run_status"] = None
+                _training_state["deploying_adapter_id"] = None
                 _save_pipeline_state()
                 logger.info(
                     "Adapter %s deployed and hot-swapped — now model v%d",
@@ -910,6 +1028,7 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
+        _training_state["deploying_adapter_id"] = None
         _save_pipeline_state()
         return False
 
@@ -918,6 +1037,7 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
+        _training_state["deploying_adapter_id"] = None
         _save_pipeline_state()
         return False
 
