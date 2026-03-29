@@ -1573,6 +1573,10 @@ async def _auto_eval_after_deploy(
         await _run_evals_for_model(model_name, model_version, adapter_id)
     except Exception:
         logger.exception("Auto-eval failed for version %d", model_version)
+    finally:
+        _training_state["eval_status"] = "completed"
+        _training_state["eval_jobs"] = {}
+        _save_pipeline_state()
 
 
 def _start_eval_watcher(
