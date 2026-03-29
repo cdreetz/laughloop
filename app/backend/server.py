@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -32,6 +33,14 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+
+# Optional R2/S3 support — only imported when R2 env vars are set
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None  # type: ignore[assignment]
+    ClientError = Exception  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("laughloop")
 
@@ -50,6 +59,25 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 LOG_DIR = Path(os.getenv("LAUGHLOOP_LOG_DIR", str(Path(__file__).parent / "logs")))
 INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
 BATCH_DIR = Path(os.getenv("LAUGHLOOP_BATCH_DIR", str(Path(__file__).parent.parent.parent / "data" / "batches")))
+
+# R2 / S3-compatible object store config
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "laughloop")
+R2_LOG_KEY = os.getenv("R2_LOG_KEY", "logs/interactions.jsonl")
+
+USE_R2 = bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and boto3)
+
+_s3_client = None
+if USE_R2:
+    _s3_client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
 
 # In-memory training state (would be persisted in production)
 _training_state: dict[str, Any] = {
@@ -80,42 +108,76 @@ You're performing live. Every message is a chance to get a laugh. Make it count.
 
 
 # ---------------------------------------------------------------------------
-# JSONL Log Storage
+# JSONL Log Storage — R2 object store or local files
 # ---------------------------------------------------------------------------
 
 # Thread lock for safe appends from concurrent requests
 _log_lock = threading.Lock()
 
 
+def _r2_read_log() -> str:
+    """Read the full JSONL log from R2. Returns empty string if not found."""
+    try:
+        resp = _s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=R2_LOG_KEY)
+        return resp["Body"].read().decode("utf-8")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return ""
+        raise
+
+
+def _r2_write_log(content: str):
+    """Write the full JSONL log to R2."""
+    _s3_client.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=R2_LOG_KEY,
+        Body=content.encode("utf-8"),
+        ContentType="application/x-ndjson",
+    )
+
+
 def _append_log(record: dict):
     """Append a single JSON record to the interactions log."""
+    line = json.dumps(record, default=str) + "\n"
     with _log_lock:
-        with open(INTERACTIONS_LOG, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        if USE_R2:
+            existing = _r2_read_log()
+            _r2_write_log(existing + line)
+        else:
+            with open(INTERACTIONS_LOG, "a") as f:
+                f.write(line)
 
 
 def _read_all_interactions() -> list[dict]:
     """Read all interaction records from the log file."""
-    if not INTERACTIONS_LOG.exists():
-        return []
+    if USE_R2:
+        content = _r2_read_log()
+    else:
+        if not INTERACTIONS_LOG.exists():
+            return []
+        with open(INTERACTIONS_LOG) as f:
+            content = f.read()
+
     records = []
-    with open(INTERACTIONS_LOG) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    for line in content.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return records
 
 
 def _rewrite_log(records: list[dict]):
     """Rewrite the entire log file (used for updates like feedback)."""
+    content = "".join(json.dumps(r, default=str) + "\n" for r in records)
     with _log_lock:
-        with open(INTERACTIONS_LOG, "w") as f:
-            for record in records:
-                f.write(json.dumps(record, default=str) + "\n")
+        if USE_R2:
+            _r2_write_log(content)
+        else:
+            with open(INTERACTIONS_LOG, "w") as f:
+                f.write(content)
 
 
 def _get_session_history(session_id: str, limit: int = 10) -> list[dict]:
@@ -168,7 +230,8 @@ class StatsResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not USE_R2:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
     # Cancel any running watcher on shutdown
     global _run_watcher_task
@@ -412,22 +475,91 @@ def _prime_headers() -> dict[str, str]:
     return headers
 
 
+def _sync_r2_to_tempfile() -> str:
+    """Download R2 log to a temp file. Returns the temp file path."""
+    content = _r2_read_log()
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False,
+    )
+    tmp.write(content)
+    tmp.close()
+    return tmp.name
+
+
+def _sync_exported_marks_to_r2(tmp_path: str):
+    """Merge exported marks from temp file back into the current R2 log.
+
+    Instead of overwriting R2 with the stale temp file, we:
+    1. Parse the temp file to find which IDs were marked exported=1
+    2. Re-read the current R2 log (which may have new records appended)
+    3. Apply only the exported marks to the current data
+    4. Write the merged result back to R2
+    This avoids overwriting interactions appended during the export window.
+    """
+    # Extract exported IDs from the temp file
+    exported_ids: set[str] = set()
+    with open(tmp_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("exported") == 1:
+                    exported_ids.add(record["id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not exported_ids:
+        return
+
+    # Merge marks into current R2 state under the lock
+    with _log_lock:
+        current = _r2_read_log()
+        merged_lines = []
+        for line in current.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("id") in exported_ids:
+                    record["exported"] = 1
+                merged_lines.append(json.dumps(record, default=str))
+            except (json.JSONDecodeError, KeyError):
+                merged_lines.append(line)
+        _r2_write_log("\n".join(merged_lines) + "\n" if merged_lines else "")
+
+
 @app.post("/pipeline/export")
 async def pipeline_export():
     """Trigger batch export from the interaction log."""
     _training_state["status"] = "exporting"
+    tmp_path: str | None = None
     try:
+        # When using R2, dump log to a temp file so the subprocess can read it
+        if USE_R2:
+            tmp_path = await asyncio.to_thread(_sync_r2_to_tempfile)
+            log_arg = tmp_path
+        else:
+            log_arg = str(INTERACTIONS_LOG)
+
         result = await asyncio.to_thread(
             subprocess.run,
             [
                 "python", str(PROJECT_ROOT / "pipeline" / "export_batch.py"),
-                "--log", str(INTERACTIONS_LOG),
+                "--log", log_arg,
                 "--min-batch-size", "1",
             ],
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
         )
+
+        # Sync exported marks back to R2 if applicable
+        if USE_R2 and tmp_path and result.returncode == 0:
+            await asyncio.to_thread(_sync_exported_marks_to_r2, tmp_path)
+
         _training_state["status"] = "idle"
 
         if result.returncode != 0:
@@ -463,6 +595,13 @@ async def pipeline_export():
     except Exception as e:
         _training_state["status"] = "idle"
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.post("/pipeline/train")
@@ -758,7 +897,7 @@ async def health():
         "status": "ok",
         "model": MODEL_NAME,
         "adapter": ADAPTER_ID or None,
-        "log_dir": str(LOG_DIR),
+        "storage": "r2" if USE_R2 else "local",
     }
 
 
