@@ -392,6 +392,8 @@ async def feedback(req: FeedbackRequest):
             "Auto-trigger: %d unexported labeled >= %d threshold",
             len(unexported_labeled), MIN_BATCH_SIZE,
         )
+        # Mark as non-idle immediately to prevent duplicate triggers
+        _training_state["status"] = "exporting"
         # Fire-and-forget: export + train in background
         asyncio.create_task(_auto_pipeline_loop())
 
@@ -820,8 +822,11 @@ async def _lazy_poll_run(run_id: str):
         logger.exception("Lazy poll failed for run %s", run_id)
 
 
-async def _auto_deploy_adapter(run_id: str):
-    """Find the latest adapter for a completed run and deploy it."""
+async def _auto_deploy_adapter(run_id: str) -> bool:
+    """Find the latest adapter for a completed run and deploy it.
+
+    Returns True if an adapter was successfully deployed, False otherwise.
+    """
     global ADAPTER_ID
     try:
         # List adapters and find ones matching this run
@@ -846,7 +851,7 @@ async def _auto_deploy_adapter(run_id: str):
             _training_state["active_run_id"] = None
             _training_state["run_status"] = None
             _save_pipeline_state()
-            return
+            return False
 
         # Pick the adapter with the highest step
         matching.sort(key=lambda a: a.get("step") or 0, reverse=True)
@@ -894,7 +899,7 @@ async def _auto_deploy_adapter(run_id: str):
                     "Adapter %s deployed and hot-swapped — now model v%d",
                     adapter_id, _training_state["model_version"],
                 )
-                return
+                return True
 
             if deploy_status in ("DEPLOY_FAILED", "UNLOADING", "UNLOAD_FAILED"):
                 logger.error("Adapter %s deployment failed: %s", adapter_id, deploy_status)
@@ -904,6 +909,7 @@ async def _auto_deploy_adapter(run_id: str):
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
         _save_pipeline_state()
+        return False
 
     except Exception:
         logger.exception("Error auto-deploying adapter for run %s", run_id)
@@ -911,6 +917,7 @@ async def _auto_deploy_adapter(run_id: str):
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
         _save_pipeline_state()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1001,7 +1008,14 @@ async def pipeline_deploy(run_id: str | None = None):
             _training_state["status"] = "idle"
             return {"success": False, "error": "No run ID specified and no active run"}
 
-        await _auto_deploy_adapter(target_run)
+        deployed = await _auto_deploy_adapter(target_run)
+        if not deployed:
+            return {
+                "success": False,
+                "error": f"Adapter deployment failed for run {target_run}",
+                "adapter_id": ADAPTER_ID or None,
+                "model_version": _training_state["model_version"],
+            }
         return {
             "success": True,
             "adapter_id": ADAPTER_ID or None,
