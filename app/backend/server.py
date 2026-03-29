@@ -663,6 +663,8 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         for i, ix in enumerate(session_ixs):
             training_records.append(_build_training_record(ix, session_ixs[:i]))
 
+    unique_count = len(training_records)
+
     # Duplicate samples to increase effective training set size for small batches.
     sample_multiplier = int(os.environ.get("LAUGHLOOP_SAMPLE_MULTIPLIER", "5"))
     if sample_multiplier > 1:
@@ -701,7 +703,7 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         if r.get("id") in exported_ids:
             r["exported"] = 1
 
-    return len(training_records), dest
+    return unique_count, dest
 
 
 @app.post("/pipeline/export")
