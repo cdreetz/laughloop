@@ -689,18 +689,19 @@ async def pipeline_train():
     try:
         run_id = await _start_training_run_api()
 
+        if not run_id:
+            _training_state["status"] = "idle"
+            _save_pipeline_state()
+            return {"success": False, "error": "No run ID returned from API"}
+
         _training_state["current_batch"] = run_id
         _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
         _training_state["batches_completed"] += 1
-
-        if run_id:
-            _training_state["active_run_id"] = run_id
-            _training_state["run_status"] = "QUEUED"
-            _training_state["status"] = "training"
-            # On long-lived servers (local dev), start background watcher
-            _start_run_watcher(run_id)
-        else:
-            _training_state["status"] = "idle"
+        _training_state["active_run_id"] = run_id
+        _training_state["run_status"] = "QUEUED"
+        _training_state["status"] = "training"
+        # On long-lived servers (local dev), start background watcher
+        _start_run_watcher(run_id)
 
         _save_pipeline_state()
         return {
