@@ -123,3 +123,22 @@ export async function fetchPipeline(): Promise<PipelineResponse> {
   if (!res.ok) throw new Error(`Pipeline failed: ${res.status}`);
   return res.json();
 }
+
+export interface EvalRun {
+  model_version: number;
+  adapter_id: string | null;
+  scores: Record<string, number>;
+  timestamp: string;
+}
+
+export interface EvalsResponse {
+  environments: string[];
+  baseline: Record<string, number>;
+  runs: EvalRun[];
+}
+
+export async function fetchEvals(): Promise<EvalsResponse> {
+  const res = await fetch(`${API_BASE}/evals`);
+  if (!res.ok) throw new Error(`Evals failed: ${res.status}`);
+  return res.json();
+}
