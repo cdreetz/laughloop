@@ -493,6 +493,17 @@ async def pipeline_status():
             # No run ID either — reset to idle to unblock the pipeline
             _training_state["status"] = "idle"
             _save_pipeline_state()
+    elif _training_state["status"] == "exporting":
+        # Recovery: export is fast and should never persist across cold starts.
+        # If we see it on a fresh request, the previous function was killed mid-export.
+        logger.warning("Recovery: resetting stuck 'exporting' state to idle")
+        _training_state["status"] = "idle"
+        _save_pipeline_state()
+    elif _training_state["status"] == "training" and not _training_state.get("active_run_id"):
+        # Recovery: training was started but the run ID was never saved.
+        logger.warning("Recovery: resetting stuck 'training' state (no run ID) to idle")
+        _training_state["status"] = "idle"
+        _save_pipeline_state()
 
     records = _read_all_interactions()
 
@@ -921,6 +932,7 @@ async def _lazy_poll_deploy(adapter_id: str):
                 "version": _training_state["model_version"],
                 "adapter_id": adapter_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "batch_size": 0,
             })
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
