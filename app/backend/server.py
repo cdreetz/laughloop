@@ -935,6 +935,9 @@ async def _lazy_poll_deploy(adapter_id: str):
         logger.info("Lazy-poll deploy: adapter %s status=%s", adapter_id, deploy_status)
 
         if deploy_status == "DEPLOYED":
+            # Guard: another code path (background watcher) may have already handled this
+            if _training_state["status"] != "deploying":
+                return
             ADAPTER_ID = adapter_id
             _training_state["model_version"] += 1
             _training_state["adapter_history"].append({
@@ -1033,6 +1036,9 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
             logger.info("Adapter %s deployment status: %s", adapter_id, deploy_status)
 
             if deploy_status == "DEPLOYED":
+                # Guard: lazy-poll may have already handled this transition
+                if _training_state["status"] != "deploying":
+                    return True
                 ADAPTER_ID = adapter_id
                 _training_state["model_version"] += 1
                 _training_state["adapter_history"].append({
