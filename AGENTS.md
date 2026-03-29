@@ -226,10 +226,10 @@ Configuration (in `server.py`):
 ### Training -> Deployment -> Inference
 
 - Training produces LoRA adapters uploaded to Prime
-- Backend auto-deploys via `POST /api/v1/deployments/{adapter_id}/deploy`
+- Backend auto-deploys via `POST /api/v1/deployments/adapters/{adapter_id}/deploy`
 - Polls deployment status until DEPLOYED
-- Passes adapter as `extra_body={"lora_id": adapter_id}` in OpenAI chat completions
-- Inference goes through `api.pinference.ai` (OpenAI-compatible API)
+- Inference uses `model="BaseModel:adapter_id"` format (e.g. `Qwen/Qwen3-4B-Instruct-2507:abc123`)
+- See https://docs.primeintellect.ai/inference/adapter-deployments for details
 
 ## Deployment
 

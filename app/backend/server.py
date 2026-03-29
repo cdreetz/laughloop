@@ -334,16 +334,15 @@ async def chat(req: ChatRequest):
 
     # Call the model
     try:
-        extra_body = {}
-        if ADAPTER_ID:
-            extra_body["lora_id"] = ADAPTER_ID
+        # Use base_model:adapter_id format per Prime docs
+        # https://docs.primeintellect.ai/inference/adapter-deployments
+        inference_model = f"{MODEL_NAME}:{ADAPTER_ID}" if ADAPTER_ID else MODEL_NAME
 
         response = await client.chat.completions.create(
-            model=MODEL_NAME,
+            model=inference_model,
             messages=messages,
             max_tokens=512,
             temperature=0.9,
-            extra_body=extra_body if extra_body else None,
         )
         assistant_message = response.choices[0].message.content or "(crickets)"
     except Exception as e:

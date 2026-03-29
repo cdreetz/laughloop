@@ -215,8 +215,7 @@ Results are displayed on the `/evals` page as a 2x2 grid of line charts with bas
 ## Development Notes
 
 - **Base model**: `Qwen/Qwen3-4B-Instruct-2507` (configurable via `LAUGHLOOP_MODEL`)
-- **Inference**: Via `api.pinference.ai` using OpenAI-compatible client
-- **LoRA adapters**: Passed as `extra_body={"lora_id": adapter_id}` in chat completions
+- **Inference**: Via Prime Inference API (`api.pinference.ai`), OpenAI-compatible
 - **Training config**: 50 steps, batch size 64, 4 rollouts/example (see `configs/rl.toml`)
 - **Feedback threshold**: 20 labeled interactions trigger auto-training (`LAUGHLOOP_MIN_BATCH`)
 - **Sample multiplier**: Each interaction duplicated 5x in training batches (`LAUGHLOOP_SAMPLE_MULTIPLIER`)
