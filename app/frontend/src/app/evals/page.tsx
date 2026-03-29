@@ -183,13 +183,39 @@ export default function EvalsPage() {
     <div className="flex h-screen flex-col bg-background text-foreground">
       <Header />
 
+      {/* Context bar — explains what this page shows */}
+      <div className="flex items-center justify-between border-b border-border-custom px-4 py-2">
+        <div>
+          <span className="font-mono text-[11px] text-foreground">
+            Model Performance
+          </span>
+          <span className="ml-3 font-mono text-[10px] text-text-dim">
+            Eval scores across training iterations
+          </span>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-1.5">
+            <div className="h-px w-4 bg-foreground" />
+            <span className="font-mono text-[10px] text-text-dim">
+              fine-tuned
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="h-px w-4 border-t border-dashed border-text-dim" />
+            <span className="font-mono text-[10px] text-text-dim">
+              base model
+            </span>
+          </div>
+        </div>
+      </div>
+
       {error && (
         <div className="border-b border-not-funny/20 bg-not-funny/5 px-4 py-1.5 font-mono text-[11px] text-not-funny">
           {error}
         </div>
       )}
 
-      {/* 2x2 grid filling the viewport — same split-panel style as chat page */}
+      {/* 2x2 grid filling the viewport */}
       <div className="grid min-h-0 flex-1 grid-cols-2 grid-rows-2">
         {environments.map((env, i) => {
           const baseline = data?.baseline?.[env] ?? null;
