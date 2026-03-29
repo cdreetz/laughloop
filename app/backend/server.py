@@ -808,7 +808,8 @@ async def _lazy_poll_run(run_id: str):
         if status == "COMPLETED":
             _training_state["status"] = "deploying"
             _save_pipeline_state()
-            await _auto_deploy_adapter(run_id)
+            # Fire-and-forget so GET /pipeline returns immediately
+            asyncio.create_task(_auto_deploy_adapter(run_id))
 
         elif status in ("FAILED", "STOPPED", "CANCELLED"):
             _training_state["status"] = "idle"
