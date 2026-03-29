@@ -117,7 +117,11 @@ def _save_pipeline_state():
 
 
 def _load_pipeline_state():
-    """Load pipeline state from R2 on cold start."""
+    """Load pipeline state from R2.
+
+    Called on every /pipeline request (not just cold start) to guarantee
+    fresh state on serverless where module-init loading can silently fail.
+    """
     global _training_state, ADAPTER_ID
     if not USE_R2:
         return
@@ -379,7 +383,9 @@ async def feedback(req: FeedbackRequest):
 
     _rewrite_log(records)
 
-    # Auto-trigger pipeline when enough labeled data has been collected
+    # Auto-trigger pipeline when enough labeled data has been collected.
+    # Reload state from R2 first so we see the real status (not stale in-memory).
+    _load_pipeline_state()
     unexported_labeled = [
         r for r in records
         if r.get("feedback") is not None and r.get("exported", 0) == 0
@@ -395,8 +401,10 @@ async def feedback(req: FeedbackRequest):
         )
         # Mark as non-idle immediately to prevent duplicate triggers
         _training_state["status"] = "exporting"
-        # Fire-and-forget: export + train in background
-        asyncio.create_task(_auto_pipeline_loop())
+        _save_pipeline_state()
+        # Await inline so it completes within the Vercel request lifecycle.
+        # On local dev with background watcher, this still works fine.
+        await _auto_pipeline_loop()
 
     return FeedbackResponse(success=True)
 
@@ -449,7 +457,28 @@ async def interactions(
 
 
 def _get_batch_files() -> list[dict]:
-    """Scan the batch directory for exported training batches."""
+    """List exported training batches from R2 or local filesystem."""
+    if USE_R2:
+        try:
+            resp = _s3_client.list_objects_v2(
+                Bucket=R2_BUCKET_NAME, Prefix="batches/batch_",
+            )
+            batches = []
+            for obj in resp.get("Contents", []):
+                key = obj["Key"]
+                filename = key.split("/")[-1]
+                batches.append({
+                    "filename": filename,
+                    "records": 0,  # can't cheaply count lines in R2
+                    "created_at": obj["LastModified"].isoformat(),
+                    "size_bytes": obj["Size"],
+                })
+            batches.sort(key=lambda b: b["created_at"], reverse=True)
+            return batches
+        except Exception:
+            logger.exception("Failed to list batches from R2")
+            return []
+
     if not BATCH_DIR.exists():
         return []
     batches = []
@@ -478,6 +507,10 @@ async def pipeline_status():
     On serverless (Vercel), also lazy-polls the active training run so the
     frontend sees up-to-date status without background tasks.
     """
+    # Reload state from R2 on every request — module-init loading is unreliable
+    # on Vercel serverless where cold-start module execution can silently fail.
+    _load_pipeline_state()
+
     # Lazy-poll: if there's an active run or deployment, check status via Prime API
     if _training_state["active_run_id"] and _training_state["status"] == "training":
         await _lazy_poll_run(_training_state["active_run_id"])
@@ -630,6 +663,13 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         for i, ix in enumerate(session_ixs):
             training_records.append(_build_training_record(ix, session_ixs[:i]))
 
+    unique_count = len(training_records)
+
+    # Duplicate samples to increase effective training set size for small batches.
+    sample_multiplier = int(os.environ.get("LAUGHLOOP_SAMPLE_MULTIPLIER", "5"))
+    if sample_multiplier > 1:
+        training_records = training_records * sample_multiplier
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     batch_content = "\n".join(json.dumps(r) for r in training_records) + "\n"
 
@@ -663,7 +703,7 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         if r.get("id") in exported_ids:
             r["exported"] = 1
 
-    return len(training_records), dest
+    return unique_count, dest
 
 
 @app.post("/pipeline/export")
@@ -1087,12 +1127,12 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
 async def _auto_pipeline_loop():
     """Full pipeline: export labeled data → start training run → track it.
 
-    Runs as a fire-and-forget task triggered from the feedback endpoint.
+    Awaited inline from the feedback endpoint so it completes within the
+    Vercel request lifecycle (fire-and-forget tasks are killed on serverless).
+    Caller must set status to "exporting" and save state before calling.
     """
     try:
-        # 1. Export
-        _training_state["status"] = "exporting"
-        _save_pipeline_state()
+        # 1. Export (status already set to "exporting" by caller)
         logger.info("Auto-pipeline: exporting batch")
 
         records = _read_all_interactions()
