@@ -663,6 +663,11 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         for i, ix in enumerate(session_ixs):
             training_records.append(_build_training_record(ix, session_ixs[:i]))
 
+    # Duplicate samples to increase effective training set size for small batches.
+    sample_multiplier = int(os.environ.get("LAUGHLOOP_SAMPLE_MULTIPLIER", "5"))
+    if sample_multiplier > 1:
+        training_records = training_records * sample_multiplier
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     batch_content = "\n".join(json.dumps(r) for r in training_records) + "\n"
 
