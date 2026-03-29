@@ -941,7 +941,7 @@ async def _lazy_poll_deploy(adapter_id: str):
                 "version": _training_state["model_version"],
                 "adapter_id": adapter_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "batch_size": 0,
+                "batch_size": adapter_data.get("step", 0),
             })
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
@@ -1159,6 +1159,7 @@ async def pipeline_deploy(run_id: str | None = None):
         target_run = run_id or _training_state.get("active_run_id")
         if not target_run:
             _training_state["status"] = "idle"
+            _save_pipeline_state()
             return {"success": False, "error": "No run ID specified and no active run"}
 
         deployed = await _auto_deploy_adapter(target_run)
