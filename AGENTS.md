@@ -2,41 +2,59 @@
 
 ## Project Overview
 
-LaughLoop is a continual learning MVP: a chat app where the AI tries to be funny, users give feedback (😂 Haha or 😐 Meh), and that feedback trains the model via reinforcement learning to get funnier over time.
+LaughLoop is an online reinforcement learning demo: a chat app where the AI tries to be funny, users give feedback (Haha or Meh), and that feedback automatically triggers RL training via the Prime Intellect platform. The model gets funnier over time without any manual intervention.
 
-The system is an end-to-end loop: **Serve → Collect → Export → Train → Deploy → Repeat**.
+The system is a fully automated loop: **Serve -> Collect -> Export -> Train -> Deploy -> Eval -> Repeat**.
 
 ## Repository Structure
 
 ```
 laughloop/
-├── app/
-│   ├── backend/
-│   │   ├── server.py              # FastAPI: /chat, /feedback, /stats, /health
-│   │   ├── requirements.txt       # Backend Python dependencies
-│   │   └── laughloop.db           # SQLite log database (created at runtime)
-│   └── frontend/
-│       └── App.jsx                # React chat UI with Haha/Meh feedback buttons
-├── pipeline/
-│   ├── export_batch.py            # Export logged interactions → JSONL training batches
-│   └── seed_data.py               # Generate synthetic test data for pipeline testing
-├── environments/
-│   └── laughloop_reward/
-│       ├── laughloop_reward.py    # Verifiers RL environment (loads JSONL, human reward)
-│       ├── pyproject.toml         # Environment package metadata + dependencies
-│       └── README.md              # Environment documentation
-├── configs/
-│   └── rl.toml                    # RL training config for `prime rl run`
-├── scripts/
-│   ├── deploy_adapter.py          # Deploy trained adapter via Prime API
-│   └── loop.sh                    # Full orchestrator: export → train → deploy
-├── data/
-│   └── batches/                   # Exported JSONL training batches (gitignored)
-├── logs/                          # Loop execution logs (gitignored)
-├── pyproject.toml                 # Top-level project dependencies
-├── .env.example                   # Environment variable template
-├── .gitignore
-└── README.md
+  app/
+    backend/
+      server.py              # FastAPI: all endpoints + auto-pipeline + eval runner
+      requirements.txt       # Python dependencies (fastapi, openai, httpx, boto3)
+      pyproject.toml         # Package metadata (used by Vercel build)
+      vercel.json            # Vercel serverless routing + CORS headers
+      logs/                  # Local JSONL logs (gitignored, only used in local dev)
+    frontend/
+      src/
+        app/
+          page.tsx           # Chat page: split-panel with chat + log viewer + pipeline
+          evals/page.tsx     # Eval plots: 2x2 grid of LineCharts (recharts)
+          layout.tsx         # Root layout with fonts + metadata
+          globals.css        # Tailwind v4 + CSS custom properties
+        components/
+          header.tsx         # Shared nav header (Chat | Evals links)
+          chat-input.tsx     # Message input box
+          chat-message.tsx   # Individual chat bubble
+          haha-button.tsx    # Haha/Meh feedback buttons
+          empty-state.tsx    # Empty chat state
+          typing-indicator.tsx
+          stats-bar.tsx      # Feedback stats display
+          log-viewer.tsx     # Interaction log table
+          pipeline-panel.tsx # Training pipeline status panel
+        lib/
+          api.ts             # API client: all fetch calls + TypeScript interfaces
+      next.config.ts         # Rewrites /api to localhost:8000 in local dev
+      package.json           # next, react, recharts, tailwind, typescript
+  pipeline/
+    export_batch.py          # Export interactions -> JSONL training batches
+    seed_data.py             # Generate synthetic test data for pipeline testing
+  environments/
+    laughloop_reward/
+      laughloop_reward.py    # Verifiers RL environment (human feedback as reward)
+      pyproject.toml         # Environment package metadata
+  configs/
+    rl.toml                  # RL training config for prime rl run
+  scripts/
+    loop.sh                  # Manual orchestrator (export -> train -> deploy)
+  data/
+    batches/                 # Exported JSONL training batches (gitignored)
+  .env.example               # All environment variables with descriptions
+  AGENTS.md                  # This file: detailed agent guide
+  CLAUDE.md                  # Quick reference for AI agents
+  README.md                  # Project overview + setup instructions
 ```
 
 ## Setup Instructions
@@ -57,14 +75,11 @@ prime login
 ### Install Dependencies
 
 ```bash
-cd laughloop
-
-# Install project dependencies
-uv sync
-
-# Or with pip
+# Backend
 pip install -r app/backend/requirements.txt
-pip install verifiers>=0.1.8 datasets openai
+
+# Frontend
+cd app/frontend && npm install
 ```
 
 ### Environment Variables
@@ -76,13 +91,19 @@ cp .env.example .env
 ```
 
 Required variables:
-- `PRIME_API_KEY` — Prime Intellect API key (get from https://app.primeintellect.ai/dashboard/tokens)
-- `LAUGHLOOP_MODEL` — Model to serve chat with (default: `openai/gpt-4.1-mini`)
-- `LAUGHLOOP_BASE_URL` — Inference API base URL (default: `https://api.pinference.ai/api/v1`)
+- `PRIME_API_KEY` - Prime Intellect API key (get from https://app.primeintellect.ai/dashboard/tokens)
+- `PRIME_TEAM_ID` - Team ID (find at Team Profile page, required for team accounts)
 
-Optional:
-- `OPENAI_API_KEY` — For the judge model in the verifiers environment (improves training signal)
-- `LAUGHLOOP_ADAPTER_ID` — Set after first training run to serve with the trained adapter
+Optional for local dev:
+- `OPENAI_API_KEY` - For the judge model in the verifiers environment
+- `LAUGHLOOP_ADAPTER_ID` - Set after first training run to serve with the trained adapter
+
+Required for deployment (Vercel + R2):
+- `R2_ACCOUNT_ID` - Cloudflare account ID
+- `R2_ACCESS_KEY_ID` - R2 S3-compatible access key
+- `R2_SECRET_ACCESS_KEY` - R2 S3-compatible secret key
+- `R2_BUCKET_NAME` - defaults to `laughloop`
+- `NEXT_PUBLIC_API_URL` - Backend URL for frontend (e.g. `https://laughloop-backend.vercel.app`)
 
 ## Running Each Component
 
@@ -111,159 +132,153 @@ curl -X POST http://localhost:8000/feedback \
 
 # Check stats
 curl http://localhost:8000/stats
+
+# Pipeline status
+curl http://localhost:8000/pipeline
+
+# Eval results
+curl http://localhost:8000/evals
+
+# Trigger eval run manually
+curl -X POST http://localhost:8000/evals/run?model_version=0
 ```
 
 ### 2. Frontend
 
-The frontend is a React component (`App.jsx`). For local development, serve it however you prefer. It expects the backend at `http://localhost:8000`. The `API_BASE` constant at the top of `App.jsx` controls this.
+```bash
+cd app/frontend
+npm run dev
+# Starts on http://localhost:3000
+```
 
-### 3. Seed Test Data
+In local dev, `next.config.ts` proxies `/api/*` to `http://localhost:8000/*` so the frontend works without setting `NEXT_PUBLIC_API_URL`.
 
-To test the pipeline without real user interactions:
+Two pages:
+- `/` - Chat page with split-panel layout (chat, log viewer, pipeline panel)
+- `/evals` - Eval plots page with 2x2 grid of performance charts
+
+### 3. Seed Test Data (optional)
 
 ```bash
 python pipeline/seed_data.py --count 100
 ```
 
-This populates the SQLite database with synthetic interactions that have feedback attached.
-
-### 4. Export Training Data
-
-```bash
-python pipeline/export_batch.py
-# Exports to data/batches/batch_<timestamp>.jsonl
-# Creates data/batches/latest.jsonl symlink
-```
-
-Options:
-- `--min-batch-size 10` — Minimum interactions needed to trigger export
-- `--no-mark` — Don't mark interactions as exported (for testing)
-- `--output path/to/file.jsonl` — Custom output path
-
-### 5. Install the Verifiers Environment
-
-```bash
-prime env install laughloop-reward --path ./environments
-```
-
-Verify installation:
-```bash
-python -c "from laughloop_reward import load_environment; env = load_environment(); print('OK')"
-```
-
-### 6. Run RL Training
-
-```bash
-prime rl run configs/rl.toml
-```
-
-This requires:
-- Exported training data at `data/batches/latest.jsonl`
-- The `laughloop-reward` environment installed
-- Valid `PRIME_API_KEY`
-
-### 7. Deploy Trained Adapter
-
-```bash
-python scripts/deploy_adapter.py
-```
-
-Or for a specific run:
-```bash
-python scripts/deploy_adapter.py --run-id <run_id>
-```
-
-### 8. Full Loop
-
-```bash
-bash scripts/loop.sh
-```
-
-## Testing the Full Pipeline
-
-The recommended test sequence:
-
-```bash
-# 1. Start the backend
-python app/backend/server.py &
-
-# 2. Seed synthetic data
-python pipeline/seed_data.py --count 100
-
-# 3. Export a training batch
-python pipeline/export_batch.py --min-batch-size 10
-
-# 4. Verify the export
-cat data/batches/latest.jsonl | head -3 | python -m json.tool
-
-# 5. Install the environment
-prime env install laughloop-reward --path ./environments
-
-# 6. Run a quick eval to verify the environment works
-prime eval run laughloop-reward -n 5 -r 1 --path ./environments \
-  -a '{"data_dir": "./data/batches", "data_file": "latest.jsonl"}'
-
-# 7. Run RL training (requires Prime account with training access)
-prime rl run configs/rl.toml
-
-# 8. Deploy the adapter
-python scripts/deploy_adapter.py
-```
+This creates synthetic interactions with feedback for testing the pipeline.
 
 ## Key Integration Points
 
-### Backend ↔ Frontend
-- Frontend calls `POST /chat` and `POST /feedback`
-- `API_BASE` in `App.jsx` must match backend address
+### Frontend -> Backend
+
+- `api.ts` defines all fetch calls and TypeScript interfaces
+- `API_BASE` is set from `NEXT_PUBLIC_API_URL` env var, or falls back to `/api` (proxied)
+- Frontend polls `/pipeline` and `/evals` every 10 seconds for live updates
 - CORS is open (`allow_origins=["*"]`) for development
 
-### Backend ↔ Database
-- SQLite at `app/backend/laughloop.db`
-- Created automatically on first backend start
-- Schema: `interactions` table with columns: id, session_id, timestamp, user_message, assistant_message, model, adapter_id, feedback, feedback_timestamp, exported
+### Backend Storage (Local vs R2)
 
-### Pipeline ↔ Database
-- `export_batch.py` reads from the same SQLite database
-- Reads rows where `feedback IS NOT NULL AND exported = 0`
-- Marks rows as `exported = 1` after successful export
-- `--db` flag to point at a different database path
+- When `R2_ACCOUNT_ID` + `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` are set AND boto3 is installed, the backend uses R2
+- Otherwise, it falls back to local JSONL files in `app/backend/logs/`
+- R2 keys used:
+  - `logs/interactions.jsonl` - interaction log
+  - `pipeline/state.json` - training pipeline state (survives Vercel cold starts)
+  - `evals/results.json` - eval results
+  - `batches/<filename>.jsonl` - exported training batches
 
-### Pipeline ↔ Environment
-- Pipeline outputs JSONL to `data/batches/`
-- Environment loads from `data/batches/latest.jsonl` by default
-- Each JSONL record has: `question`, `answer`, `prompt` (full message list), `info` (with `human_reward`)
-- The `data_dir` and `data_file` environment args control the path
+### Backend Auto-Pipeline
 
-### Environment ↔ Training
-- The `configs/rl.toml` references the environment by name: `laughloop-reward`
-- Environment args are passed via `args = { data_dir = "...", data_file = "..." }` in the TOML
-- The environment must be installed before training: `prime env install laughloop-reward --path ./environments`
+The pipeline is fully automated inside `server.py`:
 
-### Training ↔ Deployment
-- `prime rl run` produces adapters uploaded to the Prime platform
-- `deploy_adapter.py` finds the latest adapter, deploys it, and writes the adapter ID to `app/backend/.adapter_config`
-- Backend reads `LAUGHLOOP_ADAPTER_ID` env var and passes it as `lora_id` in the inference call
+1. **Feedback threshold check**: On each `/feedback` POST, checks if labeled count >= `LAUGHLOOP_MIN_BATCH` (default 20)
+2. **Inline export**: `_inline_export()` converts interactions to training JSONL (no external script needed)
+3. **Training via API**: `_start_training_run_api()` calls `POST /api/v1/training/runs` on Prime
+4. **Run monitoring**: Background task (`_watch_run`) or lazy-polling (`_lazy_poll_run`) tracks progress
+5. **Auto-deploy**: `_auto_deploy_adapter()` finds the adapter from the completed run and deploys it
+6. **Hot-swap**: `ADAPTER_ID` global is updated; next chat uses the new adapter immediately
+7. **Auto-eval**: After deploy, `_start_eval_watcher()` or `_submit_evals_serverless()` triggers hosted evals
+
+### Backend Eval System
+
+After adapter deployment, evals are auto-triggered on 4 environments:
+- `primeintellect/aime2026`, `primeintellect/gsm8k`, `primeintellect/wordle`, `prime/tau2-synth`
+
+Flow:
+1. Resolve environment slugs to IDs via `GET /api/v1/environmentshub/{owner}/{name}/@latest`
+2. Submit hosted evals via `POST /api/v1/hosted-evaluations`
+3. Poll `GET /api/v1/evaluations/{eval_id}` until complete
+4. Extract scores from metrics or sample averages
+5. Store results in R2 (`evals/results.json`)
+
+Configuration (in `server.py`):
+- `EVAL_NUM_EXAMPLES = 10`
+- `EVAL_ROLLOUTS_PER_EXAMPLE = 3`
+- `EVAL_POLL_INTERVAL = 15` seconds
+- `EVAL_MAX_POLLS = 120` (~30 min timeout)
+
+### Pipeline -> Environment -> Training
+
+- `export_batch.py` reads from JSONL log, outputs to `data/batches/`
+- Each record has: `question`, `answer`, `prompt` (full message list), `info` (with `human_reward`)
+- `laughloop_reward.py` loads batches and uses human feedback as the reward signal
+- `configs/rl.toml` references the environment by name: `prime/laughloop-reward`
+- Training produces adapters uploaded to the Prime platform
+- Sample multiplier (`LAUGHLOOP_SAMPLE_MULTIPLIER`, default 5) duplicates each interaction to reach effective batch sizes
+
+### Training -> Deployment -> Inference
+
+- Training produces LoRA adapters uploaded to Prime
+- Backend auto-deploys via `POST /api/v1/deployments/adapters/{adapter_id}/deploy`
+- Polls deployment status until DEPLOYED
+- Inference uses `model="BaseModel:adapter_id"` format (e.g. `Qwen/Qwen3-4B-Instruct-2507:abc123`)
+- See https://docs.primeintellect.ai/inference/adapter-deployments for details
+
+## Deployment
+
+### Vercel Backend
+
+- `app/backend/vercel.json` routes all requests to `server.py`
+- Vercel builds using `@vercel/python` builder
+- `pyproject.toml` lists dependencies for the Vercel build
+- `requirements.txt` is the canonical dependency list
+
+### Vercel Frontend
+
+- Standard Next.js deployment
+- `NEXT_PUBLIC_API_URL` must be set to the backend URL (baked at build time)
+- Without it, the frontend tries `/api` which only works with the local dev proxy
+
+### Serverless Considerations
+
+- No background tasks on Vercel - everything uses lazy-polling
+- State is persisted to R2 so it survives cold starts
+- `_load_pipeline_state()` is called at the start of relevant endpoints to reload from R2
+- Training monitoring, deployment polling, and eval polling all use the lazy-poll pattern:
+  - State is checked/updated on each GET request
+  - If status is "running"/"training"/"deploying", one poll cycle runs per request
 
 ## Common Issues
 
-- **"Training data not found"** — Run `python pipeline/export_batch.py` first, or seed data with `pipeline/seed_data.py`
-- **"No API key configured"** — Set `PRIME_API_KEY` in your environment or `.env` file, then `prime login`
-- **Backend can't reach inference** — Check `LAUGHLOOP_BASE_URL` and that your API key has inference access
-- **Environment not found during training** — Run `prime env install laughloop-reward --path ./environments`
-- **CORS errors in frontend** — Backend must be running; check the `API_BASE` constant in `App.jsx`
+- **401 on inference**: Check `PRIME_API_KEY` is valid. Run `prime login` to refresh. Verify the model exists with `prime inference models`.
+- **401 on platform API (evals)**: The eval endpoints may need different API key permissions. Regenerate at https://app.primeintellect.ai/dashboard/tokens.
+- **Training data not found**: Run `POST /pipeline/export` or seed data with `pipeline/seed_data.py`.
+- **Environment not found during training**: Run `prime env install laughloop-reward --path ./environments`.
+- **Frontend shows "Connection error"**: Backend isn't running, or `NEXT_PUBLIC_API_URL` isn't set on the deployed frontend.
+- **Pipeline state disappears on Vercel**: R2 credentials may be wrong. Check `GET /health` shows `"storage": "r2"`.
+- **308 redirects from backend**: Vercel adds trailing slashes. `vercel.json` has `"trailingSlash": false` and the frontend strips trailing slashes from `API_BASE`.
+- **CORS errors**: Backend has permissive CORS (`allow_origins=["*"]`). `vercel.json` also adds CORS headers as a fallback.
 
-## What May Need Finishing
+## Code Conventions
 
-- The React frontend (`App.jsx`) needs to be served — either integrate into a build system (Vite, Next.js) or serve as a standalone HTML page
-- The `LAUGHLOOP_ADAPTER_ID` update after deployment currently writes to a file; the backend needs a restart or a hot-reload mechanism to pick it up
-- The `rl.toml` config uses `Qwen/Qwen3-0.6B` as the base model — verify this is available on your Prime account with `prime rl models`
-- For production, replace SQLite with a proper database and add authentication to the API
-- The judge model component in the environment requires an `OPENAI_API_KEY` — it's optional but improves training signal
-- `loop.sh` is designed for cron — test it end-to-end before scheduling
+- **Python**: Standard formatting, type hints where practical, `pathlib.Path` for all file paths
+- **TypeScript**: Strict mode, all API responses have interfaces in `api.ts`
+- **Frontend**: App Router (no pages/ directory), Tailwind v4 with CSS custom properties for theming
+- **Design**: Monochrome/minimalist. No gradients, no bright colors, no emojis in UI. Mono font throughout.
+- **No pre-commit hooks** configured; add ruff if desired
+- Environment variables read with `os.getenv()` with sensible defaults
 
-## Code Style
+## What May Need Work
 
-- Python: standard formatting, type hints where practical
-- No pre-commit hooks configured yet; add ruff if desired
-- All paths use `Path` from pathlib where possible
-- Environment variables are read with `os.getenv()` with sensible defaults
+- **Eval baseline scores**: Real baseline scores for Qwen3-4B have not been posted yet (blocked on platform API auth). Once the API key has platform permissions, trigger `POST /evals/run?model_version=0` to run baseline evals.
+- **Score extraction**: `_extract_eval_score()` guesses metric keys (`avg_score`, `mean_score`, `score`, `accuracy`, `reward`). Verify against actual API response once evals run successfully.
+- **Environment resolution for evals**: The `_resolve_environment_id()` function calls a specific API endpoint. If the API schema changes, this needs updating.
+- **W&B integration**: The `rl.toml` has commented-out W&B config. Uncomment and set entity/project to enable training dashboards.
+- **Authentication**: No user auth on any endpoints. All APIs are open. Add auth if this goes beyond demo usage.
