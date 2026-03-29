@@ -48,7 +48,7 @@ logger = logging.getLogger("laughloop")
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 BASE_URL = os.getenv("LAUGHLOOP_BASE_URL", "https://api.pinference.ai/api/v1")
 API_KEY = os.getenv("LAUGHLOOP_API_KEY") or os.getenv("PRIME_API_KEY", "")
 ADAPTER_ID = os.getenv("LAUGHLOOP_ADAPTER_ID", "")  # set after first training run
