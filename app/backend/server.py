@@ -1288,10 +1288,10 @@ def _read_eval_results() -> dict:
             if e.response["Error"]["Code"] == "NoSuchKey":
                 return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
             logger.exception("Failed to read eval results from R2")
-            return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+            raise
         except Exception:
             logger.exception("Failed to read eval results from R2")
-            return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+            raise
     # Local file fallback
     if EVALS_FILE.exists():
         return json.loads(EVALS_FILE.read_text())
