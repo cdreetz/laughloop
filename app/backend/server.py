@@ -1311,6 +1311,7 @@ def _write_eval_results(data: dict):
             )
         except Exception:
             logger.exception("Failed to write eval results to R2")
+            raise
         return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     EVALS_FILE.write_text(payload)
