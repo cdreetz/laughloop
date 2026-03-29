@@ -95,12 +95,6 @@ export default function EvalsPage() {
                 }));
 
               const hasData = chartData.length > 0;
-              const allScores = [
-                ...chartData.map((d) => d.score),
-                ...(baseline !== null ? [baseline] : []),
-              ];
-              const yMin = allScores.length > 0 ? Math.max(0, Math.min(...allScores) - 0.05) : 0;
-              const yMax = allScores.length > 0 ? Math.min(1, Math.max(...allScores) + 0.05) : 1;
 
               return (
                 <div
@@ -144,12 +138,13 @@ export default function EvalsPage() {
                           tickLine={false}
                         />
                         <YAxis
-                          domain={[yMin, yMax]}
-                          tickFormatter={(v: number) => fmt(v)}
+                          domain={[0, 1]}
+                          ticks={[0, 0.25, 0.5, 0.75, 1]}
+                          tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
                           tick={{ fontSize: 10, fontFamily: "var(--font-mono)" }}
                           stroke="var(--text-dim)"
                           tickLine={false}
-                          width={50}
+                          width={40}
                         />
                         <Tooltip
                           contentStyle={{
@@ -178,7 +173,7 @@ export default function EvalsPage() {
                         )}
                         {hasData && (
                           <Line
-                            type="monotone"
+                            type="linear"
                             dataKey="score"
                             stroke="var(--foreground)"
                             strokeWidth={2}
