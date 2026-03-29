@@ -46,7 +46,7 @@ logger = logging.getLogger("laughloop")
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+MODEL_NAME = os.getenv("LAUGHLOOP_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 BASE_URL = os.getenv("LAUGHLOOP_BASE_URL", "https://api.pinference.ai/api/v1")
 API_KEY = os.getenv("LAUGHLOOP_API_KEY") or os.getenv("PRIME_API_KEY", "")
 ADAPTER_ID = os.getenv("LAUGHLOOP_ADAPTER_ID", "")  # set after first training run
@@ -90,6 +90,7 @@ _DEFAULT_TRAINING_STATE: dict[str, Any] = {
     "adapter_history": [],  # list of {version, adapter_id, timestamp, batch_size}
     "active_run_id": None,  # run ID being monitored by the background watcher
     "run_status": None,  # latest status from Prime for the active run
+    "run_progress": None,  # {latest_step, max_steps, last_updated_at} from Prime progress API
     "deploying_adapter_id": None,  # adapter ID being deployed (for lazy-poll)
 }
 
@@ -578,6 +579,7 @@ async def pipeline_status():
             "last_training_time": _training_state["last_training_time"],
             "active_run_id": _training_state["active_run_id"],
             "run_status": _training_state["run_status"],
+            "run_progress": _training_state.get("run_progress"),
         },
         "model": {
             "name": MODEL_NAME,
@@ -864,10 +866,14 @@ async def _watch_run(run_id: str):
 async def _lazy_poll_run(run_id: str):
     """Single-shot poll of a training run — used on serverless where we
     can't keep a background watcher alive.  Called from GET /pipeline.
+
+    Also fetches training progress (steps completed) from the Prime
+    progress API so the frontend can show a progress bar.
     """
     global ADAPTER_ID
     try:
         async with httpx.AsyncClient(timeout=15) as http_client:
+            # Fetch run status
             resp = await http_client.get(
                 f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
                 headers=_prime_headers(),
@@ -875,10 +881,28 @@ async def _lazy_poll_run(run_id: str):
             resp.raise_for_status()
             run_data = resp.json()
 
+            # Fetch training progress (best-effort, don't fail if unavailable)
+            try:
+                progress_resp = await http_client.get(
+                    f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}/progress",
+                    headers=_prime_headers(),
+                )
+                if progress_resp.status_code == 200:
+                    progress_data = progress_resp.json()
+                    max_steps = run_data.get("max_steps", 50)
+                    _training_state["run_progress"] = {
+                        "latest_step": progress_data.get("latest_step", 0),
+                        "max_steps": max_steps,
+                        "last_updated_at": progress_data.get("last_updated_at"),
+                    }
+            except Exception:
+                pass  # Progress is nice-to-have, not critical
+
         status = run_data.get("status", "UNKNOWN")
         _training_state["run_status"] = status
 
         if status == "COMPLETED":
+            _training_state["run_progress"] = None
             _training_state["status"] = "deploying"
             _save_pipeline_state()
             # Kick off adapter discovery + deploy request (non-blocking).
@@ -890,6 +914,7 @@ async def _lazy_poll_run(run_id: str):
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
             _training_state["run_status"] = None
+            _training_state["run_progress"] = None
             _save_pipeline_state()
 
         else:

@@ -68,6 +68,11 @@ export interface PipelineResponse {
     last_training_time: string | null;
     active_run_id: string | null;
     run_status: string | null;
+    run_progress: {
+      latest_step: number;
+      max_steps: number;
+      last_updated_at: string | null;
+    } | null;
   };
   model: {
     name: string;
