@@ -92,6 +92,10 @@ _DEFAULT_TRAINING_STATE: dict[str, Any] = {
     "run_status": None,  # latest status from Prime for the active run
     "run_progress": None,  # {latest_step, max_steps, last_updated_at} from Prime progress API
     "deploying_adapter_id": None,  # adapter ID being deployed (for lazy-poll)
+    "eval_status": None,  # None | "running" | "completed"
+    "eval_jobs": {},  # {env_slug: eval_id}
+    "eval_model_version": None,
+    "eval_adapter_id": None,
 }
 
 _training_state: dict[str, Any] = {**_DEFAULT_TRAINING_STATE}
@@ -284,10 +288,12 @@ async def lifespan(app: FastAPI):
     if not USE_R2:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
-    # Cancel any running watcher on shutdown (local dev only)
-    global _run_watcher_task
+    # Cancel any running watchers on shutdown (local dev only)
+    global _run_watcher_task, _eval_watcher_task
     if _run_watcher_task and not _run_watcher_task.done():
         _run_watcher_task.cancel()
+    if _eval_watcher_task and not _eval_watcher_task.done():
+        _eval_watcher_task.cancel()
 
 
 app = FastAPI(title="LaughLoop", version="0.1.0", lifespan=lifespan)
@@ -1020,6 +1026,10 @@ async def _lazy_poll_deploy(adapter_id: str):
                 "Adapter %s deployed and hot-swapped — now model v%d",
                 adapter_id, _training_state["model_version"],
             )
+            # Auto-trigger evals for the newly deployed model (serverless)
+            await _submit_evals_serverless(
+                MODEL_NAME, _training_state["model_version"], adapter_id,
+            )
 
         elif deploy_status in ("DEPLOY_FAILED", "UNLOADING", "UNLOAD_FAILED"):
             logger.error("Adapter %s deployment failed: %s", adapter_id, deploy_status)
@@ -1120,6 +1130,10 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
                 logger.info(
                     "Adapter %s deployed and hot-swapped — now model v%d",
                     adapter_id, _training_state["model_version"],
+                )
+                # Auto-trigger evals for the newly deployed model (background)
+                _start_eval_watcher(
+                    MODEL_NAME, _training_state["model_version"], adapter_id,
                 )
                 return True
 
@@ -1277,6 +1291,15 @@ EVAL_ENVIRONMENTS = [
     "prime/tau2-synth",
 ]
 
+# Hosted eval settings
+EVAL_NUM_EXAMPLES = int(os.getenv("LAUGHLOOP_EVAL_NUM_EXAMPLES", "10"))
+EVAL_ROLLOUTS_PER_EXAMPLE = int(os.getenv("LAUGHLOOP_EVAL_ROLLOUTS", "3"))
+EVAL_POLL_INTERVAL = int(os.getenv("LAUGHLOOP_EVAL_POLL_INTERVAL", "15"))
+EVAL_MAX_POLLS = int(os.getenv("LAUGHLOOP_EVAL_MAX_POLLS", "120"))  # ~30 min
+
+# Background eval watcher task (local dev only)
+_eval_watcher_task: asyncio.Task | None = None
+
 
 def _read_eval_results() -> dict:
     """Read eval results from R2 or local file."""
@@ -1317,6 +1340,349 @@ def _write_eval_results(data: dict):
     EVALS_FILE.write_text(payload)
 
 
+# ---------------------------------------------------------------------------
+# Hosted Eval Runner — triggers evals on Prime platform, polls for results
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_environment_id(owner: str, name: str) -> str | None:
+    """Resolve an environment slug (owner/name) to its platform ID."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/environmentshub/{owner}/{name}/@latest",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            details = data.get("data", data)
+            return details.get("id")
+    except Exception:
+        logger.exception("Failed to resolve environment %s/%s", owner, name)
+        return None
+
+
+async def _submit_hosted_eval(
+    environment_id: str,
+    model_name: str,
+    num_examples: int = EVAL_NUM_EXAMPLES,
+    rollouts_per_example: int = EVAL_ROLLOUTS_PER_EXAMPLE,
+    eval_name: str | None = None,
+) -> str | None:
+    """Submit a hosted evaluation to the Prime platform. Returns the evaluation ID."""
+    payload: dict[str, Any] = {
+        "environment_ids": [environment_id],
+        "inference_model": model_name,
+        "eval_config": {
+            "num_examples": num_examples,
+            "rollouts_per_example": rollouts_per_example,
+            "allow_sandbox_access": False,
+            "allow_instances_access": False,
+        },
+    }
+    if eval_name:
+        payload["name"] = eval_name
+    if TEAM_ID:
+        payload["team_id"] = TEAM_ID
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.post(
+                f"{PRIME_BASE_URL}/api/v1/hosted-evaluations",
+                headers=_prime_headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            eval_id = data.get("evaluation_id")
+            eval_ids = data.get("evaluation_ids")
+            if eval_id:
+                return eval_id
+            if eval_ids:
+                return eval_ids[0]
+            logger.error("No evaluation ID in response: %s", data)
+            return None
+    except Exception:
+        logger.exception("Failed to submit hosted eval")
+        return None
+
+
+async def _poll_eval_status(eval_id: str) -> dict[str, Any] | None:
+    """Poll a single evaluation's status. Returns the eval data dict."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/evaluations/{eval_id}",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception("Failed to poll eval %s", eval_id)
+        return None
+
+
+async def _extract_eval_score(eval_id: str) -> float | None:
+    """Extract the aggregate score from a completed evaluation.
+
+    Checks metrics first, then falls back to averaging sample scores.
+    """
+    eval_data = await _poll_eval_status(eval_id)
+    if not eval_data:
+        return None
+
+    # Check metrics for avg_score or similar
+    metrics = eval_data.get("metrics") or {}
+    for key in ("avg_score", "mean_score", "score", "accuracy", "reward"):
+        if key in metrics and metrics[key] is not None:
+            return float(metrics[key])
+
+    # Fallback: fetch samples and average their scores
+    try:
+        async with httpx.AsyncClient(timeout=30) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/evaluations/{eval_id}/samples",
+                headers=_prime_headers(),
+                params={"page": 1, "limit": 500},
+            )
+            resp.raise_for_status()
+            samples_data = resp.json()
+            samples = samples_data.get("samples", [])
+            scores = [
+                s["score"] for s in samples
+                if s.get("score") is not None
+            ]
+            if scores:
+                return sum(scores) / len(scores)
+    except Exception:
+        logger.exception("Failed to fetch samples for eval %s", eval_id)
+
+    return None
+
+
+async def _run_evals_for_model(
+    model_name: str,
+    model_version: int,
+    adapter_id: str | None = None,
+) -> dict[str, float]:
+    """Run hosted evals for all 4 environments and return scores.
+
+    Submits all evals in parallel, then polls until all complete.
+    Returns a dict of {env_name: score}.
+    """
+    logger.info(
+        "Starting evals for %s (version=%d, adapter=%s)",
+        model_name, model_version, adapter_id or "base",
+    )
+
+    # Resolve environment IDs
+    env_ids: dict[str, str] = {}
+    for env_slug in EVAL_ENVIRONMENTS:
+        owner, name = env_slug.split("/", 1)
+        env_id = await _resolve_environment_id(owner, name)
+        if env_id:
+            env_ids[env_slug] = env_id
+        else:
+            logger.warning("Could not resolve environment: %s", env_slug)
+
+    if not env_ids:
+        logger.error("No environments resolved — skipping evals")
+        return {}
+
+    # Submit hosted evals for each environment
+    eval_jobs: dict[str, str] = {}  # env_slug -> evaluation_id
+    for env_slug, env_id in env_ids.items():
+        label = "base" if model_version == 0 else f"v{model_version}"
+        eval_name = f"laughloop-{label}-{env_slug.replace('/', '-')}"
+        eval_id = await _submit_hosted_eval(
+            environment_id=env_id,
+            model_name=model_name,
+            eval_name=eval_name,
+        )
+        if eval_id:
+            eval_jobs[env_slug] = eval_id
+            logger.info("Submitted eval for %s: %s", env_slug, eval_id)
+        else:
+            logger.warning("Failed to submit eval for %s", env_slug)
+
+    if not eval_jobs:
+        logger.error("No evals submitted — skipping")
+        return {}
+
+    # Poll until all evals complete (or timeout)
+    terminal_statuses = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}
+    completed: dict[str, str] = {}  # env_slug -> status
+
+    for _ in range(EVAL_MAX_POLLS):
+        await asyncio.sleep(EVAL_POLL_INTERVAL)
+
+        for env_slug, eval_id in eval_jobs.items():
+            if env_slug in completed:
+                continue
+            eval_data = await _poll_eval_status(eval_id)
+            if not eval_data:
+                continue
+            status = eval_data.get("status", "UNKNOWN")
+            if status in terminal_statuses:
+                completed[env_slug] = status
+                logger.info("Eval %s (%s) finished: %s", env_slug, eval_id, status)
+
+        if len(completed) == len(eval_jobs):
+            break
+
+    # Extract scores from completed evals
+    scores: dict[str, float] = {}
+    for env_slug, eval_id in eval_jobs.items():
+        status = completed.get(env_slug)
+        if status != "COMPLETED":
+            logger.warning("Eval %s did not complete (status=%s)", env_slug, status)
+            continue
+        score = await _extract_eval_score(eval_id)
+        if score is not None:
+            scores[env_slug] = score
+            logger.info("Eval %s score: %.4f", env_slug, score)
+        else:
+            logger.warning("Could not extract score for %s", env_slug)
+
+    # Store results
+    if scores:
+        data = _read_eval_results()
+        entry = {
+            "model_version": model_version,
+            "adapter_id": adapter_id,
+            "scores": scores,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if model_version == 0:
+            data["baseline"] = scores
+        else:
+            data["runs"].append(entry)
+        _write_eval_results(data)
+        logger.info("Stored eval results for version %d: %s", model_version, scores)
+
+    return scores
+
+
+async def _auto_eval_after_deploy(
+    model_name: str,
+    model_version: int,
+    adapter_id: str | None = None,
+):
+    """Background task: run evals after adapter deployment completes."""
+    try:
+        await _run_evals_for_model(model_name, model_version, adapter_id)
+    except Exception:
+        logger.exception("Auto-eval failed for version %d", model_version)
+
+
+def _start_eval_watcher(
+    model_name: str,
+    model_version: int,
+    adapter_id: str | None = None,
+):
+    """Kick off a background asyncio task to run evals (local dev only)."""
+    global _eval_watcher_task
+    if _eval_watcher_task and not _eval_watcher_task.done():
+        _eval_watcher_task.cancel()
+    _eval_watcher_task = asyncio.create_task(
+        _auto_eval_after_deploy(model_name, model_version, adapter_id)
+    )
+
+
+async def _lazy_poll_evals():
+    """Single-shot poll of active eval jobs — used on serverless.
+    Called from GET /evals when eval_status is 'running'.
+    """
+    _load_pipeline_state()
+    eval_jobs = _training_state.get("eval_jobs", {})
+    if not eval_jobs:
+        return
+
+    terminal_statuses = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}
+    all_done = True
+    scores: dict[str, float] = {}
+
+    for env_slug, eval_id in eval_jobs.items():
+        eval_data = await _poll_eval_status(eval_id)
+        if not eval_data:
+            all_done = False
+            continue
+        status = eval_data.get("status", "UNKNOWN")
+        if status not in terminal_statuses:
+            all_done = False
+            continue
+        if status == "COMPLETED":
+            score = await _extract_eval_score(eval_id)
+            if score is not None:
+                scores[env_slug] = score
+
+    if all_done and scores:
+        model_version = _training_state.get("eval_model_version", 0)
+        adapter_id = _training_state.get("eval_adapter_id")
+        data = _read_eval_results()
+        entry = {
+            "model_version": model_version,
+            "adapter_id": adapter_id,
+            "scores": scores,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if model_version == 0:
+            data["baseline"] = scores
+        else:
+            data["runs"].append(entry)
+        _write_eval_results(data)
+        logger.info("Lazy-poll: stored eval results for version %d", model_version)
+        _training_state["eval_status"] = "completed"
+        _training_state["eval_jobs"] = {}
+        _save_pipeline_state()
+    elif all_done:
+        # All done but no scores extracted
+        _training_state["eval_status"] = "completed"
+        _training_state["eval_jobs"] = {}
+        _save_pipeline_state()
+
+
+async def _submit_evals_serverless(
+    model_name: str,
+    model_version: int,
+    adapter_id: str | None = None,
+):
+    """Submit hosted evals and save job IDs to state for lazy-polling.
+    Used on serverless where we can't keep a background task alive.
+    """
+    env_ids: dict[str, str] = {}
+    for env_slug in EVAL_ENVIRONMENTS:
+        owner, name = env_slug.split("/", 1)
+        env_id = await _resolve_environment_id(owner, name)
+        if env_id:
+            env_ids[env_slug] = env_id
+
+    eval_jobs: dict[str, str] = {}
+    for env_slug, env_id in env_ids.items():
+        label = "base" if model_version == 0 else f"v{model_version}"
+        eval_name = f"laughloop-{label}-{env_slug.replace('/', '-')}"
+        eval_id = await _submit_hosted_eval(
+            environment_id=env_id,
+            model_name=model_name,
+            eval_name=eval_name,
+        )
+        if eval_id:
+            eval_jobs[env_slug] = eval_id
+
+    if eval_jobs:
+        _training_state["eval_status"] = "running"
+        _training_state["eval_jobs"] = eval_jobs
+        _training_state["eval_model_version"] = model_version
+        _training_state["eval_adapter_id"] = adapter_id
+        _save_pipeline_state()
+        logger.info("Submitted %d evals for lazy-polling", len(eval_jobs))
+
+
+# ---------------------------------------------------------------------------
+# Eval Endpoints
+# ---------------------------------------------------------------------------
+
+
 class EvalResultSubmission(BaseModel):
     """Submit eval results for a model version."""
     model_version: int  # 0 = base model
@@ -1326,7 +1692,15 @@ class EvalResultSubmission(BaseModel):
 
 @app.get("/evals")
 async def get_evals():
-    """Get all eval results for plotting."""
+    """Get all eval results for plotting.
+
+    On serverless, also lazy-polls active eval jobs.
+    """
+    # Lazy-poll running evals on serverless
+    _load_pipeline_state()
+    if _training_state.get("eval_status") == "running":
+        await _lazy_poll_evals()
+
     return _read_eval_results()
 
 
@@ -1353,6 +1727,52 @@ async def submit_evals(submission: EvalResultSubmission):
 
     _write_eval_results(data)
     return {"success": True, "entry": entry}
+
+
+@app.post("/evals/run")
+async def trigger_eval_run(
+    model_version: int = Query(default=0, description="Model version (0 = base)"),
+):
+    """Manually trigger an eval run for a model version.
+
+    Submits hosted evals to Prime platform for all 4 environments.
+    On local dev, runs as a background task that polls until completion.
+    On serverless, submits and returns immediately — lazy-polling handles the rest.
+    """
+    adapter_id = ADAPTER_ID if model_version > 0 else None
+    model_name = MODEL_NAME
+
+    # Check if evals are already running
+    _load_pipeline_state()
+    if _training_state.get("eval_status") == "running":
+        return {
+            "success": False,
+            "error": "Evals are already running",
+            "eval_jobs": _training_state.get("eval_jobs", {}),
+        }
+
+    # On long-lived servers, use background task
+    try:
+        loop = asyncio.get_running_loop()
+        has_background = not os.getenv("VERCEL")
+    except RuntimeError:
+        has_background = False
+
+    if has_background:
+        _start_eval_watcher(model_name, model_version, adapter_id)
+        return {
+            "success": True,
+            "mode": "background",
+            "message": f"Eval run started for version {model_version}",
+        }
+    else:
+        await _submit_evals_serverless(model_name, model_version, adapter_id)
+        return {
+            "success": True,
+            "mode": "serverless",
+            "message": "Evals submitted — poll GET /evals for results",
+            "eval_jobs": _training_state.get("eval_jobs", {}),
+        }
 
 
 if __name__ == "__main__":
