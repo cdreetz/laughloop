@@ -19,8 +19,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
-import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -79,8 +77,11 @@ if USE_R2:
         region_name="auto",
     )
 
-# In-memory training state (would be persisted in production)
-_training_state: dict[str, Any] = {
+# Training pipeline state — persisted to R2 when available so it survives
+# serverless cold starts (Vercel).  Falls back to in-memory for local dev.
+R2_STATE_KEY = os.getenv("R2_STATE_KEY", "pipeline/state.json")
+
+_DEFAULT_TRAINING_STATE: dict[str, Any] = {
     "status": "idle",  # idle | exporting | training | deploying
     "current_batch": None,
     "batches_completed": 0,
@@ -91,8 +92,52 @@ _training_state: dict[str, Any] = {
     "run_status": None,  # latest status from Prime for the active run
 }
 
-# Background task handle for the run watcher
+_training_state: dict[str, Any] = {**_DEFAULT_TRAINING_STATE}
+
+# Background task handle for the run watcher (local dev only)
 _run_watcher_task: asyncio.Task | None = None
+
+MIN_BATCH_SIZE = int(os.getenv("LAUGHLOOP_MIN_BATCH", "20"))
+
+
+def _save_pipeline_state():
+    """Persist pipeline state to R2 so it survives serverless cold starts."""
+    if not USE_R2:
+        return
+    try:
+        _s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=R2_STATE_KEY,
+            Body=json.dumps(_training_state, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception:
+        logger.exception("Failed to save pipeline state to R2")
+
+
+def _load_pipeline_state():
+    """Load pipeline state from R2 on cold start."""
+    global _training_state, ADAPTER_ID
+    if not USE_R2:
+        return
+    try:
+        resp = _s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=R2_STATE_KEY)
+        data = json.loads(resp["Body"].read().decode("utf-8"))
+        _training_state.update(data)
+        # Restore the adapter ID from saved state
+        history = _training_state.get("adapter_history", [])
+        if history:
+            ADAPTER_ID = history[-1].get("adapter_id", "")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return  # first run, no state yet
+        logger.exception("Failed to load pipeline state from R2")
+    except Exception:
+        logger.exception("Failed to load pipeline state from R2")
+
+
+# Load persisted state on module init (serverless cold start)
+_load_pipeline_state()
 
 SYSTEM_PROMPT = """You are LaughLoop, a hilariously witty AI assistant. Your #1 goal is to make the user laugh.
 
@@ -233,7 +278,7 @@ async def lifespan(app: FastAPI):
     if not USE_R2:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
-    # Cancel any running watcher on shutdown
+    # Cancel any running watcher on shutdown (local dev only)
     global _run_watcher_task
     if _run_watcher_task and not _run_watcher_task.done():
         _run_watcher_task.cancel()
@@ -332,6 +377,24 @@ async def feedback(req: FeedbackRequest):
         raise HTTPException(status_code=404, detail="Interaction not found")
 
     _rewrite_log(records)
+
+    # Auto-trigger pipeline when enough labeled data has been collected
+    unexported_labeled = [
+        r for r in records
+        if r.get("feedback") is not None and r.get("exported", 0) == 0
+    ]
+    if (
+        len(unexported_labeled) >= MIN_BATCH_SIZE
+        and _training_state["status"] == "idle"
+        and API_KEY  # need an API key to train
+    ):
+        logger.info(
+            "Auto-trigger: %d unexported labeled >= %d threshold",
+            len(unexported_labeled), MIN_BATCH_SIZE,
+        )
+        # Fire-and-forget: export + train in background
+        asyncio.create_task(_auto_pipeline_loop())
+
     return FeedbackResponse(success=True)
 
 
@@ -407,7 +470,15 @@ def _get_batch_files() -> list[dict]:
 
 @app.get("/pipeline")
 async def pipeline_status():
-    """Get training pipeline status for the pipeline visualization panel."""
+    """Get training pipeline status for the pipeline visualization panel.
+
+    On serverless (Vercel), also lazy-polls the active training run so the
+    frontend sees up-to-date status without background tasks.
+    """
+    # Lazy-poll: if there's an active run, check its status via Prime API
+    if _training_state["active_run_id"] and _training_state["status"] == "training":
+        await _lazy_poll_run(_training_state["active_run_id"])
+
     records = _read_all_interactions()
 
     total = len(records)
@@ -437,8 +508,8 @@ async def pipeline_status():
         },
         "batch_queue": {
             "pending_for_export": len(unexported),
-            "min_batch_size": int(os.getenv("LAUGHLOOP_MIN_BATCH", "20")),
-            "ready_for_export": len(unexported) >= int(os.getenv("LAUGHLOOP_MIN_BATCH", "20")),
+            "min_batch_size": MIN_BATCH_SIZE,
+            "ready_for_export": len(unexported) >= MIN_BATCH_SIZE,
             "batches": batches[:5],  # last 5 batches
         },
         "training": {
@@ -475,189 +546,168 @@ def _prime_headers() -> dict[str, str]:
     return headers
 
 
-def _sync_r2_to_tempfile() -> str:
-    """Download R2 log to a temp file. Returns the temp file path."""
-    content = _r2_read_log()
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False,
-    )
-    tmp.write(content)
-    tmp.close()
-    return tmp.name
 
 
-def _sync_exported_marks_to_r2(tmp_path: str):
-    """Merge exported marks from temp file back into the current R2 log.
+# ---------------------------------------------------------------------------
+# In-process export — works on Vercel (no subprocess)
+# ---------------------------------------------------------------------------
 
-    Instead of overwriting R2 with the stale temp file, we:
-    1. Parse the temp file to find which IDs were marked exported=1
-    2. Re-read the current R2 log (which may have new records appended)
-    3. Apply only the exported marks to the current data
-    4. Write the merged result back to R2
-    This avoids overwriting interactions appended during the export window.
+_EXPORT_SYSTEM_PROMPT = SYSTEM_PROMPT  # reuse the same prompt for training data
+
+
+def _build_training_record(interaction: dict, context: list[dict]) -> dict:
+    """Convert an interaction into a training-ready record."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": _EXPORT_SYSTEM_PROMPT}]
+    for ctx in context[-4:]:
+        messages.append({"role": "user", "content": ctx["user_message"]})
+        messages.append({"role": "assistant", "content": ctx["assistant_message"]})
+    messages.append({"role": "user", "content": interaction["user_message"]})
+
+    reward = 1.0 if interaction.get("feedback") == 1 else 0.0
+    return {
+        "question": interaction["user_message"],
+        "answer": interaction["assistant_message"],
+        "prompt": messages,
+        "info": {
+            "interaction_id": interaction["id"],
+            "session_id": interaction["session_id"],
+            "timestamp": interaction["timestamp"],
+            "model": interaction.get("model", MODEL_NAME),
+            "adapter_id": interaction.get("adapter_id", ""),
+            "human_reward": reward,
+            "feedback": "funny" if interaction.get("feedback") == 1 else "not_funny",
+        },
+    }
+
+
+def _inline_export(records: list[dict]) -> tuple[int, str | None]:
+    """Export unexported labeled records in-process.
+
+    Returns (records_exported, batch_key_or_path).
+    Marks exported records in the passed-in list (caller must persist).
     """
-    # Extract exported IDs from the temp file
-    exported_ids: set[str] = set()
-    with open(tmp_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                if record.get("exported") == 1:
-                    exported_ids.add(record["id"])
-            except (json.JSONDecodeError, KeyError):
-                continue
+    unexported = [
+        r for r in records
+        if r.get("feedback") is not None and r.get("exported", 0) == 0
+    ]
+    if len(unexported) < 1:
+        return 0, None
 
-    if not exported_ids:
-        return
+    # Group by session for context
+    sessions: dict[str, list[dict]] = {}
+    for ix in unexported:
+        sid = ix["session_id"]
+        sessions.setdefault(sid, []).append(ix)
 
-    # Merge marks into current R2 state under the lock
-    with _log_lock:
-        current = _r2_read_log()
-        merged_lines = []
-        for line in current.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                if record.get("id") in exported_ids:
-                    record["exported"] = 1
-                merged_lines.append(json.dumps(record, default=str))
-            except (json.JSONDecodeError, KeyError):
-                merged_lines.append(line)
-        _r2_write_log("\n".join(merged_lines) + "\n" if merged_lines else "")
+    training_records: list[dict] = []
+    for _sid, session_ixs in sessions.items():
+        for i, ix in enumerate(session_ixs):
+            training_records.append(_build_training_record(ix, session_ixs[:i]))
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    batch_content = "\n".join(json.dumps(r) for r in training_records) + "\n"
+
+    if USE_R2:
+        batch_key = f"batches/batch_{timestamp}.jsonl"
+        _s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=batch_key,
+            Body=batch_content.encode("utf-8"),
+            ContentType="application/x-ndjson",
+        )
+        dest = batch_key
+    else:
+        BATCH_DIR.mkdir(parents=True, exist_ok=True)
+        batch_path = BATCH_DIR / f"batch_{timestamp}.jsonl"
+        batch_path.write_text(batch_content)
+        dest = str(batch_path)
+
+    # Mark as exported
+    exported_ids = {ix["id"] for ix in unexported}
+    for r in records:
+        if r.get("id") in exported_ids:
+            r["exported"] = 1
+
+    return len(training_records), dest
 
 
 @app.post("/pipeline/export")
 async def pipeline_export():
-    """Trigger batch export from the interaction log."""
+    """Trigger batch export from the interaction log (in-process, no subprocess)."""
     _training_state["status"] = "exporting"
-    tmp_path: str | None = None
     try:
-        # When using R2, dump log to a temp file so the subprocess can read it
-        if USE_R2:
-            tmp_path = await asyncio.to_thread(_sync_r2_to_tempfile)
-            log_arg = tmp_path
-        else:
-            log_arg = str(INTERACTIONS_LOG)
-
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "python", str(PROJECT_ROOT / "pipeline" / "export_batch.py"),
-                "--log", log_arg,
-                "--min-batch-size", "1",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(PROJECT_ROOT),
-        )
-
-        # Sync exported marks back to R2 if applicable
-        if USE_R2 and tmp_path and result.returncode == 0:
-            await asyncio.to_thread(_sync_exported_marks_to_r2, tmp_path)
-
+        records = _read_all_interactions()
+        count, dest = _inline_export(records)
+        if count > 0:
+            _rewrite_log(records)  # persist exported marks
         _training_state["status"] = "idle"
-
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "error": result.stderr or result.stdout,
-            }
-
-        # Parse output to find the batch file
-        output = result.stdout
-        batch_file = None
-        records_exported = 0
-        for line in output.splitlines():
-            if "Exported" in line and "training records" in line:
-                parts = line.split()
-                for i, p in enumerate(parts):
-                    if p == "Exported":
-                        try:
-                            records_exported = int(parts[i + 1])
-                        except (IndexError, ValueError):
-                            pass
-            if "Batch ready for training:" in line:
-                batch_file = line.split(":")[-1].strip()
-            if line.startswith("Exported") and "to" in line:
-                batch_file = line.split("to")[-1].strip()
-
+        _save_pipeline_state()
         return {
             "success": True,
-            "records_exported": records_exported,
-            "batch_file": batch_file,
-            "output": output,
+            "records_exported": count,
+            "batch_file": dest,
         }
     except Exception as e:
         _training_state["status"] = "idle"
+        _save_pipeline_state()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up temp file
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+
+
+async def _start_training_run_api() -> str | None:
+    """Start an RL training run via Prime REST API. Returns the run ID."""
+    payload = {
+        "model": {"name": MODEL_NAME},
+        "environments": [{"id": "prime/laughloop-reward"}],
+        "max_steps": 50,
+        "batch_size": 64,
+        "rollouts_per_example": 4,
+        "learning_rate": 5e-6,
+        "max_tokens": 512,
+        "temperature": 0.9,
+        "checkpoint_interval": 25,
+        "checkpoint_keep_cloud": 3,
+        "adapter_interval": 0,
+        "adapter_keep_last": 3,
+    }
+    async with httpx.AsyncClient(timeout=30) as http_client:
+        resp = await http_client.post(
+            f"{PRIME_BASE_URL}/api/v1/rft/runs",
+            headers=_prime_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    return data.get("run", {}).get("id")
 
 
 @app.post("/pipeline/train")
 async def pipeline_train():
-    """Start an RL training run on Prime."""
+    """Start an RL training run on Prime via REST API."""
     _training_state["status"] = "training"
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "prime", "rl", "run",
-                str(PROJECT_ROOT / "configs" / "rl.toml"),
-                "--plain",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(PROJECT_ROOT),
-            env={**os.environ, "PRIME_API_KEY": API_KEY},
-        )
-
-        if result.returncode != 0:
-            _training_state["status"] = "idle"
-            return {
-                "success": False,
-                "error": result.stderr or result.stdout,
-            }
-
-        # Parse run ID from output
-        run_id = None
-        output = result.stdout
-        for line in output.splitlines():
-            if "training/" in line:
-                # URL like https://app.primeintellect.ai/dashboard/training/RUN_ID
-                run_id = line.strip().split("/")[-1]
-                break
+        run_id = await _start_training_run_api()
 
         _training_state["current_batch"] = run_id
         _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
         _training_state["batches_completed"] += 1
 
-        # Start background watcher to monitor run and auto-deploy adapter
         if run_id:
             _training_state["active_run_id"] = run_id
-            _training_state["run_status"] = "PENDING"
+            _training_state["run_status"] = "QUEUED"
             _training_state["status"] = "training"
+            # On long-lived servers (local dev), start background watcher
             _start_run_watcher(run_id)
         else:
             _training_state["status"] = "idle"
 
+        _save_pipeline_state()
         return {
             "success": True,
             "run_id": run_id,
-            "output": output,
         }
     except Exception as e:
         _training_state["status"] = "idle"
+        _save_pipeline_state()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -676,7 +726,11 @@ def _start_run_watcher(run_id: str):
 
 
 async def _watch_run(run_id: str):
-    """Poll Prime API for run status; when COMPLETED, deploy the adapter."""
+    """Poll Prime API for run status; when COMPLETED, deploy the adapter.
+
+    Used for long-lived servers (local dev). On serverless, _lazy_poll_run
+    handles this instead.
+    """
     global ADAPTER_ID
     poll_interval = 30  # seconds between status checks
     max_polls = 360  # ~3 hours max before giving up
@@ -696,6 +750,7 @@ async def _watch_run(run_id: str):
 
                 status = run_data.get("status", "UNKNOWN")
                 _training_state["run_status"] = status
+                _save_pipeline_state()
                 logger.info("Run %s status: %s", run_id, status)
 
                 if status == "COMPLETED":
@@ -709,6 +764,7 @@ async def _watch_run(run_id: str):
                     _training_state["status"] = "idle"
                     _training_state["active_run_id"] = None
                     _training_state["run_status"] = None
+                    _save_pipeline_state()
                     return
 
                 # Still running — keep polling
@@ -722,10 +778,46 @@ async def _watch_run(run_id: str):
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
+        _save_pipeline_state()
 
     except asyncio.CancelledError:
         logger.info("Run watcher for %s cancelled", run_id)
         return
+
+
+async def _lazy_poll_run(run_id: str):
+    """Single-shot poll of a training run — used on serverless where we
+    can't keep a background watcher alive.  Called from GET /pipeline.
+    """
+    global ADAPTER_ID
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
+                headers=_prime_headers(),
+            )
+            resp.raise_for_status()
+            run_data = resp.json()
+
+        status = run_data.get("status", "UNKNOWN")
+        _training_state["run_status"] = status
+
+        if status == "COMPLETED":
+            _training_state["status"] = "deploying"
+            _save_pipeline_state()
+            await _auto_deploy_adapter(run_id)
+
+        elif status in ("FAILED", "STOPPED", "CANCELLED"):
+            _training_state["status"] = "idle"
+            _training_state["active_run_id"] = None
+            _training_state["run_status"] = None
+            _save_pipeline_state()
+
+        else:
+            _save_pipeline_state()
+
+    except Exception:
+        logger.exception("Lazy poll failed for run %s", run_id)
 
 
 async def _auto_deploy_adapter(run_id: str):
@@ -753,6 +845,7 @@ async def _auto_deploy_adapter(run_id: str):
             _training_state["status"] = "idle"
             _training_state["active_run_id"] = None
             _training_state["run_status"] = None
+            _save_pipeline_state()
             return
 
         # Pick the adapter with the highest step
@@ -769,8 +862,8 @@ async def _auto_deploy_adapter(run_id: str):
             )
             resp.raise_for_status()
 
-        # Poll deployment status
-        for _ in range(30):  # up to 5 minutes
+        # Poll deployment status (up to 5 minutes)
+        for _ in range(30):
             await asyncio.sleep(10)
             async with httpx.AsyncClient(timeout=30) as http_client:
                 resp = await http_client.get(
@@ -796,6 +889,7 @@ async def _auto_deploy_adapter(run_id: str):
                 _training_state["status"] = "idle"
                 _training_state["active_run_id"] = None
                 _training_state["run_status"] = None
+                _save_pipeline_state()
                 logger.info(
                     "Adapter %s deployed and hot-swapped — now model v%d",
                     adapter_id, _training_state["model_version"],
@@ -809,12 +903,71 @@ async def _auto_deploy_adapter(run_id: str):
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
+        _save_pipeline_state()
 
     except Exception:
         logger.exception("Error auto-deploying adapter for run %s", run_id)
         _training_state["status"] = "idle"
         _training_state["active_run_id"] = None
         _training_state["run_status"] = None
+        _save_pipeline_state()
+
+
+# ---------------------------------------------------------------------------
+# Auto-Pipeline Loop — export + train + deploy triggered from feedback
+# ---------------------------------------------------------------------------
+
+
+async def _auto_pipeline_loop():
+    """Full pipeline: export labeled data → start training run → track it.
+
+    Runs as a fire-and-forget task triggered from the feedback endpoint.
+    """
+    try:
+        # 1. Export
+        _training_state["status"] = "exporting"
+        _save_pipeline_state()
+        logger.info("Auto-pipeline: exporting batch")
+
+        records = _read_all_interactions()
+        count, dest = _inline_export(records)
+        if count > 0:
+            _rewrite_log(records)
+        logger.info("Auto-pipeline: exported %d records to %s", count, dest)
+
+        if count == 0:
+            _training_state["status"] = "idle"
+            _save_pipeline_state()
+            return
+
+        # 2. Start training
+        _training_state["status"] = "training"
+        _save_pipeline_state()
+        logger.info("Auto-pipeline: starting training run")
+
+        run_id = await _start_training_run_api()
+        if not run_id:
+            logger.error("Auto-pipeline: failed to get run ID")
+            _training_state["status"] = "idle"
+            _save_pipeline_state()
+            return
+
+        _training_state["current_batch"] = run_id
+        _training_state["last_training_time"] = datetime.now(timezone.utc).isoformat()
+        _training_state["batches_completed"] += 1
+        _training_state["active_run_id"] = run_id
+        _training_state["run_status"] = "QUEUED"
+        _save_pipeline_state()
+        logger.info("Auto-pipeline: training run %s started", run_id)
+
+        # On long-lived servers, start the background watcher.
+        # On serverless, lazy-polling in GET /pipeline handles the rest.
+        _start_run_watcher(run_id)
+
+    except Exception:
+        logger.exception("Auto-pipeline loop failed")
+        _training_state["status"] = "idle"
+        _save_pipeline_state()
 
 
 @app.get("/pipeline/runs")
@@ -839,55 +992,24 @@ async def pipeline_runs():
 
 @app.post("/pipeline/deploy")
 async def pipeline_deploy(run_id: str | None = None):
-    """Deploy the latest adapter from a completed training run."""
+    """Deploy the latest adapter from a completed training run via API."""
     global ADAPTER_ID
     _training_state["status"] = "deploying"
     try:
-        cmd = [
-            "python", str(PROJECT_ROOT / "scripts" / "deploy_adapter.py"),
-        ]
-        if run_id:
-            cmd.extend(["--run-id", run_id])
+        target_run = run_id or _training_state.get("active_run_id")
+        if not target_run:
+            _training_state["status"] = "idle"
+            return {"success": False, "error": "No run ID specified and no active run"}
 
-        result = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(PROJECT_ROOT),
-            env={**os.environ, "PRIME_API_KEY": API_KEY},
-        )
-
-        _training_state["status"] = "idle"
-
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "error": result.stderr or result.stdout,
-            }
-
-        # Try to parse adapter ID from output
-        output = result.stdout
-        for line in output.splitlines():
-            if "LAUGHLOOP_ADAPTER_ID=" in line:
-                adapter_id = line.split("=", 1)[-1].strip()
-                ADAPTER_ID = adapter_id
-                _training_state["model_version"] += 1
-                _training_state["adapter_history"].append({
-                    "version": _training_state["model_version"],
-                    "adapter_id": adapter_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                break
-
+        await _auto_deploy_adapter(target_run)
         return {
             "success": True,
             "adapter_id": ADAPTER_ID or None,
             "model_version": _training_state["model_version"],
-            "output": output,
         }
     except Exception as e:
         _training_state["status"] = "idle"
+        _save_pipeline_state()
         raise HTTPException(status_code=500, detail=str(e))
 
 
