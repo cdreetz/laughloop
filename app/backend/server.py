@@ -33,6 +33,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+# Optional R2/S3 support — only imported when R2 env vars are set
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None  # type: ignore[assignment]
+    ClientError = Exception  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("laughloop")
 
 # ---------------------------------------------------------------------------
@@ -50,6 +58,25 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 LOG_DIR = Path(os.getenv("LAUGHLOOP_LOG_DIR", str(Path(__file__).parent / "logs")))
 INTERACTIONS_LOG = LOG_DIR / "interactions.jsonl"
 BATCH_DIR = Path(os.getenv("LAUGHLOOP_BATCH_DIR", str(Path(__file__).parent.parent.parent / "data" / "batches")))
+
+# R2 / S3-compatible object store config
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "laughloop")
+R2_LOG_KEY = os.getenv("R2_LOG_KEY", "logs/interactions.jsonl")
+
+USE_R2 = bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and boto3)
+
+_s3_client = None
+if USE_R2:
+    _s3_client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
 
 # In-memory training state (would be persisted in production)
 _training_state: dict[str, Any] = {
@@ -80,42 +107,76 @@ You're performing live. Every message is a chance to get a laugh. Make it count.
 
 
 # ---------------------------------------------------------------------------
-# JSONL Log Storage
+# JSONL Log Storage — R2 object store or local files
 # ---------------------------------------------------------------------------
 
 # Thread lock for safe appends from concurrent requests
 _log_lock = threading.Lock()
 
 
+def _r2_read_log() -> str:
+    """Read the full JSONL log from R2. Returns empty string if not found."""
+    try:
+        resp = _s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=R2_LOG_KEY)
+        return resp["Body"].read().decode("utf-8")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return ""
+        raise
+
+
+def _r2_write_log(content: str):
+    """Write the full JSONL log to R2."""
+    _s3_client.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=R2_LOG_KEY,
+        Body=content.encode("utf-8"),
+        ContentType="application/x-ndjson",
+    )
+
+
 def _append_log(record: dict):
     """Append a single JSON record to the interactions log."""
+    line = json.dumps(record, default=str) + "\n"
     with _log_lock:
-        with open(INTERACTIONS_LOG, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        if USE_R2:
+            existing = _r2_read_log()
+            _r2_write_log(existing + line)
+        else:
+            with open(INTERACTIONS_LOG, "a") as f:
+                f.write(line)
 
 
 def _read_all_interactions() -> list[dict]:
     """Read all interaction records from the log file."""
-    if not INTERACTIONS_LOG.exists():
-        return []
+    if USE_R2:
+        content = _r2_read_log()
+    else:
+        if not INTERACTIONS_LOG.exists():
+            return []
+        with open(INTERACTIONS_LOG) as f:
+            content = f.read()
+
     records = []
-    with open(INTERACTIONS_LOG) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    for line in content.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return records
 
 
 def _rewrite_log(records: list[dict]):
     """Rewrite the entire log file (used for updates like feedback)."""
+    content = "".join(json.dumps(r, default=str) + "\n" for r in records)
     with _log_lock:
-        with open(INTERACTIONS_LOG, "w") as f:
-            for record in records:
-                f.write(json.dumps(record, default=str) + "\n")
+        if USE_R2:
+            _r2_write_log(content)
+        else:
+            with open(INTERACTIONS_LOG, "w") as f:
+                f.write(content)
 
 
 def _get_session_history(session_id: str, limit: int = 10) -> list[dict]:
@@ -168,7 +229,8 @@ class StatsResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not USE_R2:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
     yield
     # Cancel any running watcher on shutdown
     global _run_watcher_task
@@ -758,7 +820,7 @@ async def health():
         "status": "ok",
         "model": MODEL_NAME,
         "adapter": ADAPTER_ID or None,
-        "log_dir": str(LOG_DIR),
+        "storage": "r2" if USE_R2 else "local",
     }
 
 
