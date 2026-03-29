@@ -7,8 +7,23 @@
   ],
   "routes": [
     {
+      "src": "/api/(.*)",
+      "dest": "server.py"
+    },
+    {
       "src": "/(.*)",
       "dest": "server.py"
     }
-  ]
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, PUT, DELETE, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization" }
+      ]
+    }
+  ],
+  "trailingSlash": false
 }
