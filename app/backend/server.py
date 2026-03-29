@@ -1262,6 +1262,98 @@ async def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# Eval Results — stored in R2 or local file
+# ---------------------------------------------------------------------------
+
+R2_EVALS_KEY = "evals/results.json"
+EVALS_FILE = LOG_DIR / "evals.json"
+
+# The 4 eval environments we track
+EVAL_ENVIRONMENTS = [
+    "primeintellect/aime2026",
+    "primeintellect/gsm8k",
+    "primeintellect/wordle",
+    "prime/tau2-synth",
+]
+
+
+def _read_eval_results() -> dict:
+    """Read eval results from R2 or local file."""
+    if USE_R2:
+        try:
+            resp = _s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=R2_EVALS_KEY)
+            return json.loads(resp["Body"].read().decode("utf-8"))
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+            logger.exception("Failed to read eval results from R2")
+            return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+        except Exception:
+            logger.exception("Failed to read eval results from R2")
+            return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+    # Local file fallback
+    if EVALS_FILE.exists():
+        return json.loads(EVALS_FILE.read_text())
+    return {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+
+
+def _write_eval_results(data: dict):
+    """Write eval results to R2 or local file."""
+    payload = json.dumps(data, indent=2)
+    if USE_R2:
+        try:
+            _s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=R2_EVALS_KEY,
+                Body=payload.encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            logger.exception("Failed to write eval results to R2")
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    EVALS_FILE.write_text(payload)
+
+
+class EvalResultSubmission(BaseModel):
+    """Submit eval results for a model version."""
+    model_version: int  # 0 = base model
+    adapter_id: str | None = None
+    scores: dict[str, float]  # env_name -> score (0.0 - 1.0)
+
+
+@app.get("/evals")
+async def get_evals():
+    """Get all eval results for plotting."""
+    return _read_eval_results()
+
+
+@app.post("/evals")
+async def submit_evals(submission: EvalResultSubmission):
+    """Submit eval results for a model version.
+
+    Used after running evals locally or via CI to record scores.
+    """
+    data = _read_eval_results()
+
+    entry = {
+        "model_version": submission.model_version,
+        "adapter_id": submission.adapter_id,
+        "scores": submission.scores,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if submission.model_version == 0:
+        # Base model scores — update the baseline
+        data["baseline"] = submission.scores
+    else:
+        data["runs"].append(entry)
+
+    _write_eval_results(data)
+    return {"success": True, "entry": entry}
+
+
 if __name__ == "__main__":
     import uvicorn
 
