@@ -486,11 +486,49 @@ def _sync_r2_to_tempfile() -> str:
     return tmp.name
 
 
-def _sync_tempfile_to_r2(tmp_path: str):
-    """Upload modified temp file back to R2 (for exported marks)."""
+def _sync_exported_marks_to_r2(tmp_path: str):
+    """Merge exported marks from temp file back into the current R2 log.
+
+    Instead of overwriting R2 with the stale temp file, we:
+    1. Parse the temp file to find which IDs were marked exported=1
+    2. Re-read the current R2 log (which may have new records appended)
+    3. Apply only the exported marks to the current data
+    4. Write the merged result back to R2
+    This avoids overwriting interactions appended during the export window.
+    """
+    # Extract exported IDs from the temp file
+    exported_ids: set[str] = set()
     with open(tmp_path) as f:
-        content = f.read()
-    _r2_write_log(content)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("exported") == 1:
+                    exported_ids.add(record["id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not exported_ids:
+        return
+
+    # Merge marks into current R2 state under the lock
+    with _log_lock:
+        current = _r2_read_log()
+        merged_lines = []
+        for line in current.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("id") in exported_ids:
+                    record["exported"] = 1
+                merged_lines.append(json.dumps(record, default=str))
+            except (json.JSONDecodeError, KeyError):
+                merged_lines.append(line)
+        _r2_write_log("\n".join(merged_lines) + "\n" if merged_lines else "")
 
 
 @app.post("/pipeline/export")
@@ -520,7 +558,7 @@ async def pipeline_export():
 
         # Sync exported marks back to R2 if applicable
         if USE_R2 and tmp_path and result.returncode == 0:
-            await asyncio.to_thread(_sync_tempfile_to_r2, tmp_path)
+            await asyncio.to_thread(_sync_exported_marks_to_r2, tmp_path)
 
         _training_state["status"] = "idle"
 
