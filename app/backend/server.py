@@ -483,6 +483,16 @@ async def pipeline_status():
         await _lazy_poll_run(_training_state["active_run_id"])
     elif _training_state["status"] == "deploying" and _training_state.get("deploying_adapter_id"):
         await _lazy_poll_deploy(_training_state["deploying_adapter_id"])
+    elif _training_state["status"] == "deploying" and not _training_state.get("deploying_adapter_id"):
+        # Recovery: serverless killed the function before _start_adapter_deploy
+        # could save the adapter ID.  Retry adapter discovery from the run ID.
+        run_id = _training_state.get("active_run_id")
+        if run_id:
+            asyncio.create_task(_start_adapter_deploy(run_id))
+        else:
+            # No run ID either — reset to idle to unblock the pipeline
+            _training_state["status"] = "idle"
+            _save_pipeline_state()
 
     records = _read_all_interactions()
 
