@@ -488,7 +488,7 @@ async def pipeline_status():
         # could save the adapter ID.  Retry adapter discovery from the run ID.
         run_id = _training_state.get("active_run_id")
         if run_id:
-            asyncio.create_task(_start_adapter_deploy(run_id))
+            await _start_adapter_deploy(run_id)
         else:
             # No run ID either — reset to idle to unblock the pipeline
             _training_state["status"] = "idle"
@@ -646,6 +646,15 @@ def _inline_export(records: list[dict]) -> tuple[int, str | None]:
         BATCH_DIR.mkdir(parents=True, exist_ok=True)
         batch_path = BATCH_DIR / f"batch_{timestamp}.jsonl"
         batch_path.write_text(batch_content)
+        # Create latest.jsonl symlink for the local CLI training workflow
+        latest_path = BATCH_DIR / "latest.jsonl"
+        if latest_path.exists() or latest_path.is_symlink():
+            latest_path.unlink()
+        try:
+            latest_path.symlink_to(batch_path.name)
+        except OSError:
+            import shutil
+            shutil.copy2(batch_path, latest_path)
         dest = str(batch_path)
 
     # Mark as exported
@@ -835,7 +844,7 @@ async def _lazy_poll_run(run_id: str):
             # Kick off adapter discovery + deploy request (non-blocking).
             # The actual deployment polling is handled by _lazy_poll_deploy
             # on subsequent GET /pipeline requests.
-            asyncio.create_task(_start_adapter_deploy(run_id))
+            await _start_adapter_deploy(run_id)
 
         elif status in ("FAILED", "STOPPED", "CANCELLED"):
             _training_state["status"] = "idle"
