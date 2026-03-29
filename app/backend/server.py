@@ -1132,6 +1132,8 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
                     adapter_id, _training_state["model_version"],
                 )
                 # Auto-trigger evals for the newly deployed model (background)
+                _training_state["eval_status"] = "running"
+                _save_pipeline_state()
                 _start_eval_watcher(
                     MODEL_NAME, _training_state["model_version"], adapter_id,
                 )
