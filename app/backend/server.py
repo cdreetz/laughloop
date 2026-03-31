@@ -15,11 +15,8 @@ Endpoints:
   GET  /health           — Health check (includes current model info)
 """
 
-from pathlib import Path as _Path
 from dotenv import load_dotenv
-# Walk up from server.py -> backend -> app -> laughloop to find .env
-_server_dir = _Path(__file__).resolve().parent
-load_dotenv(_server_dir.parent.parent / ".env")
+load_dotenv()
 
 import asyncio
 import json
