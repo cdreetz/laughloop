@@ -15,8 +15,11 @@ Endpoints:
   GET  /health           — Health check (includes current model info)
 """
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import asyncio
 import json
