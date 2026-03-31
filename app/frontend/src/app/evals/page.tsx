@@ -12,7 +12,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { Header } from "@/components/header";
-import { fetchEvals, type EvalsResponse } from "@/lib/api";
+import { fetchEvals, fetchPipeline, type EvalsResponse, type PipelineResponse } from "@/lib/api";
 
 /** Short display name for an environment path like "primeintellect/gsm8k" */
 function envLabel(env: string): string {
@@ -150,14 +150,16 @@ const POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right"] as co
 export default function EvalsPage() {
   const [data, setData] = useState<EvalsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [evalStatus, setEvalStatus] = useState<PipelineResponse["evals"] | null>(null);
 
   useEffect(() => {
     let active = true;
     const load = async () => {
       try {
-        const res = await fetchEvals();
+        const [res, pipeline] = await Promise.all([fetchEvals(), fetchPipeline()]);
         if (active) {
           setData(res);
+          setEvalStatus(pipeline.evals);
           setError(null);
         }
       } catch (err) {
@@ -208,6 +210,18 @@ export default function EvalsPage() {
           </div>
         </div>
       </div>
+
+      {evalStatus?.status === "running" && (
+        <div className="flex items-center gap-2 border-b border-border-custom px-4 py-1.5">
+          <span className="inline-block h-3 w-3 animate-spin rounded-full border border-foreground border-t-transparent" />
+          <span className="font-mono text-[11px] text-foreground">
+            Evals running{evalStatus.model_version === 0 ? " (baseline)" : ` (v${evalStatus.model_version})`}
+          </span>
+          <span className="font-mono text-[10px] text-text-dim">
+            {Object.keys(evalStatus.jobs).length} environment{Object.keys(evalStatus.jobs).length !== 1 ? "s" : ""}
+          </span>
+        </div>
+      )}
 
       {error && (
         <div className="border-b border-not-funny/20 bg-not-funny/5 px-4 py-1.5 font-mono text-[11px] text-not-funny">

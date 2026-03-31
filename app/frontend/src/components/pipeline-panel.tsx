@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { fetchPipeline, type PipelineResponse } from "@/lib/api";
+import { fetchPipeline, resetPipelineStage, type PipelineResponse } from "@/lib/api";
 
 interface PipelinePanelProps {
   refreshKey: number;
@@ -35,15 +35,31 @@ function Spinner() {
   );
 }
 
+function StageIcon({ status }: { status: "idle" | "active" | "done" }) {
+  if (status === "active") return <Spinner />;
+  if (status === "done")
+    return (
+      <span className="inline-flex h-3 w-3 items-center justify-center rounded-full bg-foreground/10 text-[8px] text-foreground">
+        ✓
+      </span>
+    );
+  return <span className="inline-block h-3 w-3 rounded-full border border-border-custom" />;
+}
+
 function Stage({
   label,
   active,
+  done,
+  resetButton,
   children,
 }: {
   label: string;
   active?: boolean;
+  done?: boolean;
+  resetButton?: React.ReactNode;
   children: React.ReactNode;
 }) {
+  const status = active ? "active" : done ? "done" : "idle";
   return (
     <div
       className={`space-y-2 rounded-md border px-3 py-2 ${
@@ -52,11 +68,14 @@ function Stage({
           : "border-transparent"
       }`}
     >
-      <div className="flex items-center">
-        <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-text-dim">
-          {label}
-        </span>
-        <PulsingDot active={!!active} />
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <StageIcon status={status} />
+          <span className="font-mono text-[10px] font-medium uppercase tracking-wider text-text-dim">
+            {label}
+          </span>
+        </div>
+        {resetButton}
       </div>
       {children}
     </div>
@@ -73,8 +92,56 @@ function formatTimeAgo(isoString: string): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+function ResetButton({
+  stage,
+  onReset,
+}: {
+  stage: "training" | "deployment" | "eval" | "all";
+  onReset: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const handleClick = async () => {
+    if (!confirming) {
+      setConfirming(true);
+      setTimeout(() => setConfirming(false), 3000);
+      return;
+    }
+    setLoading(true);
+    try {
+      await resetPipelineStage(stage);
+      onReset();
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+      setConfirming(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleClick}
+      disabled={loading}
+      className="font-mono text-[10px] text-text-dim hover:text-foreground transition-colors disabled:opacity-50"
+    >
+      {loading ? "resetting..." : confirming ? "confirm reset?" : "reset"}
+    </button>
+  );
+}
+
 export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
   const [pipeline, setPipeline] = useState<PipelineResponse | null>(null);
+
+  const refreshNow = async () => {
+    try {
+      const data = await fetchPipeline();
+      setPipeline(data);
+    } catch {
+      // ignore
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -96,10 +163,11 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
 
   if (!pipeline) return null;
 
-  const { data_collection, batch_queue, training, model } = pipeline;
+  const { data_collection, batch_queue, training, model, evals } = pipeline;
   const isExporting = training.status === "exporting";
   const isTraining = training.status === "training";
   const isDeploying = training.status === "deploying";
+  const isEvaling = evals?.status === "running";
 
   return (
     <div className="flex h-full flex-col">
@@ -107,16 +175,20 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
         <h3 className="font-mono text-[11px] font-medium text-text-dim">
           Training Pipeline
         </h3>
-        <span className="font-mono text-[10px] text-text-dim">
-          {model.version_display}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[10px] text-text-dim">
+            {model.version_display}
+          </span>
+          {(isTraining || isDeploying || isExporting) && (
+            <ResetButton stage="all" onReset={refreshNow} />
+          )}
+        </div>
       </div>
 
       <div className="flex-1 space-y-2 overflow-y-auto p-3">
         {/* Stage 1: Collect Feedback */}
         <Stage
           label="1. Collect Feedback"
-          active={training.status === "idle" && !batch_queue.ready_for_export}
         >
           <div className="space-y-1.5">
             <div className="flex justify-between font-mono text-[11px]">
@@ -147,7 +219,7 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
         </Stage>
 
         {/* Stage 2: Export Batch */}
-        <Stage label="2. Export Batch" active={isExporting}>
+        <Stage label="2. Export Batch" active={isExporting} done={batch_queue.batches.length > 0}>
           {isExporting && (
             <div className="flex items-center gap-2 font-mono text-[11px] text-foreground">
               <Spinner />
@@ -180,7 +252,9 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
         </Stage>
 
         {/* Stage 3: RL Training */}
-        <Stage label="3. RL Training" active={isTraining}>
+        <Stage label="3. RL Training" active={isTraining} done={training.batches_completed > 0} resetButton={
+          isTraining ? <ResetButton stage="training" onReset={refreshNow} /> : undefined
+        }>
           <div className="space-y-1.5">
             <div className="flex justify-between font-mono text-[11px]">
               <span className="text-text-dim">
@@ -256,7 +330,9 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
         </Stage>
 
         {/* Stage 4: Deploy Adapter */}
-        <Stage label="4. Deploy Adapter" active={isDeploying}>
+        <Stage label="4. Deploy Adapter" active={isDeploying} done={!!model.adapter_id} resetButton={
+          isDeploying ? <ResetButton stage="deployment" onReset={refreshNow} /> : undefined
+        }>
           {isDeploying && (
             <div className="flex items-center gap-2 font-mono text-[11px] text-foreground">
               <Spinner />
@@ -289,6 +365,59 @@ export function PipelinePanel({ refreshKey }: PipelinePanelProps) {
               </div>
             )}
           </div>
+        </Stage>
+
+        {/* Stage 5: Eval */}
+        <Stage
+          label="5. Eval"
+          active={isEvaling}
+          done={evals?.status === "completed"}
+          resetButton={
+            isEvaling ? <ResetButton stage="eval" onReset={refreshNow} /> : undefined
+          }
+        >
+          {isEvaling && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 font-mono text-[11px] text-foreground">
+                <Spinner />
+                Running evals...
+              </div>
+              {Object.keys(evals?.jobs || {}).length > 0 && (
+                <div className="space-y-0.5">
+                  {Object.entries(evals.jobs).map(([env]) => {
+                    const jobStatus = evals.job_statuses?.[env];
+                    const done = jobStatus === "COMPLETED";
+                    const failed = jobStatus === "FAILED" || jobStatus === "TIMEOUT" || jobStatus === "CANCELLED";
+                    return (
+                      <div key={env} className="flex items-center gap-1.5 font-mono text-[10px] text-text-dim">
+                        {done ? (
+                          <span className="inline-flex h-3 w-3 items-center justify-center rounded-full bg-foreground/10 text-[8px] text-foreground">✓</span>
+                        ) : failed ? (
+                          <span className="inline-flex h-3 w-3 items-center justify-center rounded-full bg-not-funny/10 text-[8px] text-not-funny">✗</span>
+                        ) : (
+                          <Spinner />
+                        )}
+                        <span>{env.split("/").pop()}</span>
+                        {failed && <span className="text-not-funny">{jobStatus?.toLowerCase()}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+          {evals?.status === "completed" && (
+            <p className="font-mono text-[10px] text-text-dim">
+              Evals complete{evals.model_version !== null && (
+                <> ({evals.model_version === 0 ? "baseline" : `v${evals.model_version}`})</>
+              )}
+            </p>
+          )}
+          {!evals?.status && (
+            <p className="font-mono text-[10px] text-text-dim">
+              Waiting for deployment
+            </p>
+          )}
         </Stage>
       </div>
     </div>

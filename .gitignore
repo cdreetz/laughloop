@@ -12,3 +12,6 @@ app/backend/.adapter_config
 node_modules/
 .next/
 app/backend/logs/
+
+outputs/
+secrets.env

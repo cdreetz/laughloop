@@ -41,6 +41,16 @@ export function Header({ onNewChat }: HeaderProps) {
         >
           Evals
         </Link>
+        <Link
+          href="/admin"
+          className={`rounded px-3 py-1 font-mono text-[11px] transition-colors ${
+            pathname === "/admin"
+              ? "bg-foreground/5 font-medium text-foreground"
+              : "text-text-dim hover:bg-black/5 hover:text-foreground"
+          }`}
+        >
+          Admin
+        </Link>
       </nav>
       <div className="ml-auto">
         {onNewChat && (

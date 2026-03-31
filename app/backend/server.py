@@ -15,6 +15,12 @@ Endpoints:
   GET  /health           — Health check (includes current model info)
 """
 
+from pathlib import Path as _Path
+from dotenv import load_dotenv
+# Walk up from server.py -> backend -> app -> laughloop to find .env
+_server_dir = _Path(__file__).resolve().parent
+load_dotenv(_server_dir.parent.parent / ".env")
+
 import asyncio
 import json
 import logging
@@ -336,7 +342,7 @@ async def chat(req: ChatRequest):
     try:
         # Use base_model:adapter_id format per Prime docs
         # https://docs.primeintellect.ai/inference/adapter-deployments
-        inference_model = f"{MODEL_NAME}:{ADAPTER_ID}" if ADAPTER_ID else MODEL_NAME
+        inference_model = f"{RL_BASE_MODEL}:{ADAPTER_ID}" if ADAPTER_ID else MODEL_NAME
 
         response = await client.chat.completions.create(
             model=inference_model,
@@ -544,6 +550,10 @@ async def pipeline_status():
         _training_state["status"] = "idle"
         _save_pipeline_state()
 
+    # Lazy-poll evals if running
+    if _training_state.get("eval_status") == "running":
+        await _lazy_poll_evals()
+
     records = _read_all_interactions()
 
     total = len(records)
@@ -587,11 +597,17 @@ async def pipeline_status():
             "run_progress": _training_state.get("run_progress"),
         },
         "model": {
-            "name": MODEL_NAME,
+            "name": RL_BASE_MODEL if ADAPTER_ID else MODEL_NAME,
             "version": model_version,
             "version_display": model_display,
             "adapter_id": ADAPTER_ID or None,
             "adapter_history": _training_state["adapter_history"][-5:],
+        },
+        "evals": {
+            "status": _training_state.get("eval_status"),
+            "jobs": _training_state.get("eval_jobs", {}),
+            "job_statuses": _training_state.get("eval_job_statuses", {}),
+            "model_version": _training_state.get("eval_model_version"),
         },
     }
 
@@ -735,21 +751,24 @@ async def pipeline_export():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+RL_BASE_MODEL = os.getenv("LAUGHLOOP_RL_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+
+
 async def _start_training_run_api() -> str | None:
     """Start an RL training run via Prime REST API. Returns the run ID."""
     payload = {
-        "model": {"name": MODEL_NAME},
+        "model": {"name": RL_BASE_MODEL},
         "environments": [{"id": "prime/laughloop-reward"}],
-        "max_steps": 50,
-        "batch_size": 64,
+        "max_steps": 10,
+        "batch_size": 16,
         "rollouts_per_example": 4,
         "learning_rate": 5e-6,
         "max_tokens": 512,
         "temperature": 0.9,
-        "checkpoint_interval": 25,
-        "checkpoint_keep_cloud": 3,
+        "checkpoint_interval": 10,
+        "checkpoint_keep_cloud": 1,
         "adapter_interval": 0,
-        "adapter_keep_last": 3,
+        "adapter_keep_last": 1,
     }
     async with httpx.AsyncClient(timeout=30) as http_client:
         resp = await http_client.post(
@@ -757,6 +776,8 @@ async def _start_training_run_api() -> str | None:
             headers=_prime_headers(),
             json=payload,
         )
+        if resp.status_code >= 400:
+            logger.error("Prime training API error %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
         data = resp.json()
     return data.get("run", {}).get("id")
@@ -829,7 +850,8 @@ async def _watch_run(run_id: str):
                         headers=_prime_headers(),
                     )
                     resp.raise_for_status()
-                    run_data = resp.json()
+                    raw = resp.json()
+                    run_data = raw.get("run", raw)
 
                 status = run_data.get("status", "UNKNOWN")
                 _training_state["run_status"] = status
@@ -884,7 +906,8 @@ async def _lazy_poll_run(run_id: str):
                 headers=_prime_headers(),
             )
             resp.raise_for_status()
-            run_data = resp.json()
+            raw = resp.json()
+            run_data = raw.get("run", raw)  # API wraps in {"run": {...}}
 
             # Fetch training progress (best-effort, don't fail if unavailable)
             try:
@@ -936,19 +959,20 @@ async def _start_adapter_deploy(run_id: str):
     on subsequent GET /pipeline requests.  Does NOT poll — returns quickly.
     """
     try:
+        # Get adapters from the run data directly
         async with httpx.AsyncClient(timeout=30) as http_client:
             resp = await http_client.get(
-                f"{PRIME_BASE_URL}/api/v1/deployments/adapters",
+                f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
                 headers=_prime_headers(),
-                params={"page": 1, "limit": 50},
             )
             resp.raise_for_status()
-            data = resp.json()
+            raw = resp.json()
+            run_data = raw.get("run", raw)
 
-        adapters = data.get("data", data.get("adapters", []))
+        adapters = run_data.get("adapters", [])
         matching = [
             a for a in adapters
-            if a.get("rftRunId") == run_id and a.get("status") == "READY"
+            if a.get("status") == "READY"
         ]
 
         if not matching:
@@ -968,7 +992,7 @@ async def _start_adapter_deploy(run_id: str):
         # Issue deploy request
         async with httpx.AsyncClient(timeout=30) as http_client:
             resp = await http_client.post(
-                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}/deploy",
+                f"{PRIME_BASE_URL}/api/v1/rft/adapters/{adapter_id}/deploy",
                 headers=_prime_headers(),
             )
             resp.raise_for_status()
@@ -993,13 +1017,22 @@ async def _lazy_poll_deploy(adapter_id: str):
     """
     global ADAPTER_ID
     try:
+        run_id = _training_state.get("active_run_id")
+        if not run_id:
+            logger.warning("Lazy-poll deploy: no active run ID, resetting to idle")
+            _training_state["status"] = "idle"
+            _training_state["deploying_adapter_id"] = None
+            _save_pipeline_state()
+            return
         async with httpx.AsyncClient(timeout=15) as http_client:
             resp = await http_client.get(
-                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}",
+                f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
                 headers=_prime_headers(),
             )
             resp.raise_for_status()
-            adapter_data = resp.json()
+            raw = resp.json()
+            rd = raw.get("run", raw)
+            adapter_data = next((a for a in rd.get("adapters", []) if a["id"] == adapter_id), {})
 
         deploy_status = adapter_data.get("deploymentStatus", "")
         logger.info("Lazy-poll deploy: adapter %s status=%s", adapter_id, deploy_status)
@@ -1055,19 +1088,20 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
     """
     global ADAPTER_ID
     try:
+        # Get adapters from the run data directly
         async with httpx.AsyncClient(timeout=30) as http_client:
             resp = await http_client.get(
-                f"{PRIME_BASE_URL}/api/v1/deployments/adapters",
+                f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
                 headers=_prime_headers(),
-                params={"page": 1, "limit": 50},
             )
             resp.raise_for_status()
-            data = resp.json()
+            raw = resp.json()
+            run_data = raw.get("run", raw)
 
-        adapters = data.get("data", data.get("adapters", []))
+        adapters = run_data.get("adapters", [])
         matching = [
             a for a in adapters
-            if a.get("rftRunId") == run_id and a.get("status") == "READY"
+            if a.get("status") == "READY"
         ]
 
         if not matching:
@@ -1087,7 +1121,7 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
         # Deploy it
         async with httpx.AsyncClient(timeout=30) as http_client:
             resp = await http_client.post(
-                f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}/deploy",
+                f"{PRIME_BASE_URL}/api/v1/rft/adapters/{adapter_id}/deploy",
                 headers=_prime_headers(),
             )
             resp.raise_for_status()
@@ -1100,11 +1134,14 @@ async def _auto_deploy_adapter(run_id: str) -> bool:
             await asyncio.sleep(10)
             async with httpx.AsyncClient(timeout=30) as http_client:
                 resp = await http_client.get(
-                    f"{PRIME_BASE_URL}/api/v1/deployments/adapters/{adapter_id}",
+                    f"{PRIME_BASE_URL}/api/v1/rft/runs/{run_id}",
                     headers=_prime_headers(),
                 )
                 resp.raise_for_status()
-                adapter_data = resp.json()
+                raw = resp.json()
+                rd = raw.get("run", raw)
+                # Find the adapter by ID in the run's adapter list
+                adapter_data = next((a for a in rd.get("adapters", []) if a["id"] == adapter_id), {})
 
             deploy_status = adapter_data.get("deploymentStatus", "")
             logger.info("Adapter %s deployment status: %s", adapter_id, deploy_status)
@@ -1267,6 +1304,165 @@ async def pipeline_deploy(run_id: str | None = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ResetRequest(BaseModel):
+    stage: str  # "training" | "deployment" | "eval" | "all"
+
+
+@app.post("/pipeline/reset")
+async def pipeline_reset(body: ResetRequest):
+    """Reset a stuck pipeline stage back to idle.
+
+    Stages:
+      training   — clears active run, resets status to idle
+      deployment — clears deploying adapter, resets status to idle
+      eval       — clears eval jobs and status
+      all        — resets the entire pipeline to idle (preserves history)
+    """
+    _load_pipeline_state()
+    stage = body.stage
+
+    if stage in ("training", "all"):
+        _training_state["status"] = "idle"
+        _training_state["active_run_id"] = None
+        _training_state["run_status"] = None
+        _training_state["run_progress"] = None
+        _training_state["current_batch"] = None
+
+    if stage in ("deployment", "all"):
+        _training_state["deploying_adapter_id"] = None
+        if _training_state["status"] == "deploying":
+            _training_state["status"] = "idle"
+
+    if stage in ("eval", "all"):
+        _training_state["eval_status"] = None
+        _training_state["eval_jobs"] = {}
+        _training_state["eval_job_statuses"] = {}
+        _training_state["eval_model_version"] = None
+        _training_state["eval_adapter_id"] = None
+
+    _save_pipeline_state()
+    logger.info("Pipeline reset: stage=%s, new status=%s", stage, _training_state["status"])
+    return {"success": True, "stage": stage, "status": _training_state["status"]}
+
+
+class SyntheticRequest(BaseModel):
+    count: int = 20  # how many synthetic interactions to generate
+
+
+SYNTHETIC_PROMPTS = [
+    "Tell me a joke about programming",
+    "Why is the sky blue?",
+    "What's the meaning of life?",
+    "Explain quantum physics but make it funny",
+    "What would a cat say if it could talk?",
+    "Give me a pickup line for a data scientist",
+    "Why did the chicken cross the road?",
+    "What's your hot take on pineapple pizza?",
+    "Tell me something that will blow my mind",
+    "If you were a superhero what would your power be?",
+    "What's the worst advice you've ever heard?",
+    "Explain blockchain to a 5 year old",
+    "What would happen if dogs could code?",
+    "Give me a haiku about Mondays",
+    "What's the funniest thing about humans?",
+    "If AI took over the world what would change first?",
+    "Tell me a dad joke",
+    "What's the deal with airline food?",
+    "Roast me gently",
+    "What would your Yelp review of Earth be?",
+    "If you could rename any animal what would it be?",
+    "What's your conspiracy theory about socks disappearing?",
+    "Explain gravity like you're a stand-up comedian",
+    "What would a fortune cookie written by AI say?",
+    "Tell me an anti-joke",
+    "What's the most overrated thing in the world?",
+    "If you had a catchphrase what would it be?",
+    "Write a limerick about debugging",
+    "What would Gordon Ramsay say about my code?",
+    "Give me an inspirational quote but make it absurd",
+]
+
+
+@app.post("/admin/generate-synthetic")
+async def generate_synthetic(body: SyntheticRequest):
+    """Generate synthetic chat interactions with random feedback for training.
+
+    Creates interactions using the current model and randomly assigns
+    funny/not-funny feedback so they can trigger the training pipeline.
+    """
+    import random
+
+    count = min(body.count, 50)  # cap at 50 per request
+    generated = 0
+    errors = 0
+    session_id = f"synthetic-{uuid.uuid4()}"
+
+    prompts = random.sample(SYNTHETIC_PROMPTS, min(count, len(SYNTHETIC_PROMPTS)))
+    # If we need more than available prompts, cycle through them
+    while len(prompts) < count:
+        prompts.extend(random.sample(SYNTHETIC_PROMPTS, min(count - len(prompts), len(SYNTHETIC_PROMPTS))))
+
+    for prompt in prompts[:count]:
+        try:
+            inference_model = f"{RL_BASE_MODEL}:{ADAPTER_ID}" if ADAPTER_ID else MODEL_NAME
+            response = await client.chat.completions.create(
+                model=inference_model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=256,
+                temperature=0.9,
+            )
+            assistant_message = response.choices[0].message.content or "(crickets)"
+
+            interaction_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            # Random feedback: ~60% funny to give a positive training signal
+            is_funny = random.random() < 0.6
+            record = {
+                "id": interaction_id,
+                "session_id": session_id,
+                "timestamp": now,
+                "user_message": prompt,
+                "assistant_message": assistant_message,
+                "model": MODEL_NAME,
+                "adapter_id": ADAPTER_ID,
+                "feedback": 1 if is_funny else 0,
+                "feedback_timestamp": now,
+                "exported": 0,
+            }
+            _append_log(record)
+            generated += 1
+        except Exception as e:
+            logger.error("Synthetic generation error: %s", e)
+            errors += 1
+
+    # Auto-trigger pipeline if we have enough unexported labeled data
+    if generated > 0 and API_KEY:
+        _load_pipeline_state()
+        records = _read_all_interactions()
+        unexported_labeled = [
+            r for r in records
+            if r.get("feedback") is not None and r.get("exported", 0) == 0
+        ]
+        if len(unexported_labeled) >= MIN_BATCH_SIZE and _training_state["status"] == "idle":
+            logger.info(
+                "Synthetic auto-trigger: %d unexported labeled >= %d threshold",
+                len(unexported_labeled), MIN_BATCH_SIZE,
+            )
+            _training_state["status"] = "exporting"
+            _save_pipeline_state()
+            await _auto_pipeline_loop()
+
+    return {
+        "success": True,
+        "generated": generated,
+        "errors": errors,
+        "session_id": session_id,
+    }
+
+
 @app.get("/health")
 async def health():
     return {
@@ -1286,10 +1482,10 @@ EVALS_FILE = LOG_DIR / "evals.json"
 
 # The 4 eval environments we track
 EVAL_ENVIRONMENTS = [
-    "primeintellect/aime2026",
-    "primeintellect/gsm8k",
+    "prime/swe-grep",
+    "primeintellect/math-group",
     "primeintellect/wordle",
-    "prime/tau2-synth",
+    "prime/tau2-bench",
 ]
 
 # Hosted eval settings
@@ -1510,6 +1706,12 @@ async def _run_evals_for_model(
         logger.error("No evals submitted — skipping")
         return {}
 
+    # Persist job IDs to state so the UI can show progress
+    _training_state["eval_jobs"] = eval_jobs
+    _training_state["eval_model_version"] = model_version
+    _training_state["eval_adapter_id"] = adapter_id
+    _save_pipeline_state()
+
     # Poll until all evals complete (or timeout)
     terminal_statuses = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}
     completed: dict[str, str] = {}  # env_slug -> status
@@ -1599,7 +1801,10 @@ def _start_eval_watcher(
 
 async def _lazy_poll_evals():
     """Single-shot poll of active eval jobs — used on serverless.
-    Called from GET /evals when eval_status is 'running'.
+    Called from GET /evals and GET /pipeline when eval_status is 'running'.
+
+    Tracks per-job status in eval_job_statuses so the UI can show
+    independent progress for each environment.
     """
     _load_pipeline_state()
     eval_jobs = _training_state.get("eval_jobs", {})
@@ -1607,15 +1812,25 @@ async def _lazy_poll_evals():
         return
 
     terminal_statuses = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"}
+    job_statuses = _training_state.get("eval_job_statuses", {})
     all_done = True
     scores: dict[str, float] = {}
 
     for env_slug, eval_id in eval_jobs.items():
+        # Skip already-terminal jobs
+        if job_statuses.get(env_slug) in terminal_statuses:
+            if job_statuses[env_slug] == "COMPLETED":
+                score = await _extract_eval_score(eval_id)
+                if score is not None:
+                    scores[env_slug] = score
+            continue
+
         eval_data = await _poll_eval_status(eval_id)
         if not eval_data:
             all_done = False
             continue
         status = eval_data.get("status", "UNKNOWN")
+        job_statuses[env_slug] = status
         if status not in terminal_statuses:
             all_done = False
             continue
@@ -1623,6 +1838,9 @@ async def _lazy_poll_evals():
             score = await _extract_eval_score(eval_id)
             if score is not None:
                 scores[env_slug] = score
+
+    _training_state["eval_job_statuses"] = job_statuses
+    _save_pipeline_state()
 
     if all_done and scores:
         model_version = _training_state.get("eval_model_version", 0)
@@ -1642,11 +1860,13 @@ async def _lazy_poll_evals():
         logger.info("Lazy-poll: stored eval results for version %d", model_version)
         _training_state["eval_status"] = "completed"
         _training_state["eval_jobs"] = {}
+        _training_state["eval_job_statuses"] = {}
         _save_pipeline_state()
     elif all_done:
         # All done but no scores extracted
         _training_state["eval_status"] = "completed"
         _training_state["eval_jobs"] = {}
+        _training_state["eval_job_statuses"] = {}
         _save_pipeline_state()
 
 
@@ -1737,6 +1957,14 @@ async def submit_evals(submission: EvalResultSubmission):
     return {"success": True, "entry": entry}
 
 
+@app.delete("/evals")
+async def clear_evals():
+    """Clear all eval results and reset to defaults."""
+    data = {"environments": EVAL_ENVIRONMENTS, "baseline": {}, "runs": []}
+    _write_eval_results(data)
+    return {"success": True}
+
+
 @app.post("/evals/run")
 async def trigger_eval_run(
     model_version: int = Query(default=0, description="Model version (0 = base)"),
@@ -1748,7 +1976,7 @@ async def trigger_eval_run(
     On serverless, submits and returns immediately — lazy-polling handles the rest.
     """
     adapter_id = ADAPTER_ID if model_version > 0 else None
-    model_name = MODEL_NAME
+    model_name = f"{RL_BASE_MODEL}:{adapter_id}" if adapter_id else RL_BASE_MODEL
 
     # Check if evals are already running
     _load_pipeline_state()

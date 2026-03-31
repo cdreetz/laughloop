@@ -86,6 +86,12 @@ export interface PipelineResponse {
       batch_size: number;
     }>;
   };
+  evals: {
+    status: string | null;
+    jobs: Record<string, string>;
+    job_statuses: Record<string, string>;
+    model_version: number | null;
+  };
 }
 
 export async function sendChat(message: string, sessionId: string | null): Promise<ChatResponse> {
@@ -135,6 +141,54 @@ export interface EvalsResponse {
   environments: string[];
   baseline: Record<string, number>;
   runs: EvalRun[];
+}
+
+export async function resetPipelineStage(stage: "training" | "deployment" | "eval" | "all"): Promise<{ success: boolean; stage: string; status: string }> {
+  const res = await fetch(`${API_BASE}/pipeline/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stage }),
+  });
+  if (!res.ok) throw new Error(`Reset failed: ${res.status}`);
+  return res.json();
+}
+
+export async function triggerExport(): Promise<{ success: boolean; records_exported: number; batch_file: string | null }> {
+  const res = await fetch(`${API_BASE}/pipeline/export`, { method: "POST" });
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  return res.json();
+}
+
+export async function triggerTrain(): Promise<{ success: boolean; run_id?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/pipeline/train`, { method: "POST" });
+  if (!res.ok) throw new Error(`Train failed: ${res.status}`);
+  return res.json();
+}
+
+export async function triggerDeploy(runId?: string): Promise<{ success: boolean; adapter_id?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/pipeline/deploy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(runId ? { run_id: runId } : {}),
+  });
+  if (!res.ok) throw new Error(`Deploy failed: ${res.status}`);
+  return res.json();
+}
+
+export async function triggerEvalRun(modelVersion: number = 0): Promise<{ success: boolean; mode?: string; message?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/evals/run?model_version=${modelVersion}`, { method: "POST" });
+  if (!res.ok) throw new Error(`Eval run failed: ${res.status}`);
+  return res.json();
+}
+
+export async function generateSynthetic(count: number = 20): Promise<{ success: boolean; generated: number; errors: number }> {
+  const res = await fetch(`${API_BASE}/admin/generate-synthetic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ count }),
+  });
+  if (!res.ok) throw new Error(`Synthetic generation failed: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchEvals(): Promise<EvalsResponse> {
